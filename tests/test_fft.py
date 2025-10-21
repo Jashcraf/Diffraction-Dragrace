@@ -1,0 +1,103 @@
+# Needs to be done at the top otherwise it doesn't work
+import jax
+jax.config.update("jax_enable_x64", True)
+import numpy as tnp
+import matplotlib.pyplot as plt
+from time import perf_counter
+
+# Just for array conversion
+import jax.numpy as jnp
+import torch
+import tensorflow as tf
+
+# All of our convenience functions
+from mathops import (
+    np,
+    fft2,
+    set_backend_to_jax,
+    set_backend_to_tensorflow,
+    set_backend_to_torch,
+    set_backend_to_numpy,
+)
+
+# Define a circle
+Ns = [128, 256, 512, 1024, 2048, 4096]
+N_TRIALS = 100
+methods = [
+    set_backend_to_jax,
+    set_backend_to_tensorflow,
+    set_backend_to_torch,
+    set_backend_to_numpy,
+]
+
+timing_np = []
+timing_tf = []
+timing_torch = []
+timing_jax = []
+
+err_np = []
+err_tf = []
+err_torch = []
+err_jax = []
+
+for N in Ns:
+
+    # Re-build a circular aperture
+    x = np.linspace(-1, 1, N)
+    X, Y = np.meshgrid(x, x)
+    aperture = np.zeros_like(X)
+    R = np.hypot(X, Y)
+    aperture[R < 0.5] = 1
+
+    # make sure they are all the same data type
+    aperture_numpy = aperture.copy().astype(np.complex128)
+    aperture_jax = jnp.array(aperture, dtype=jnp.complex128)
+    aperture_torch = torch.tensor(aperture, dtype=torch.complex128)
+    aperture_tf = tf.constant(aperture, dtype=tf.complex128)
+
+    apertures = [
+        aperture_jax,
+        aperture_tf,
+        aperture_torch,
+        aperture_numpy,
+    ]
+
+    for i, (method, aperture) in enumerate(zip(methods, apertures)):
+        method()
+        timing = []
+
+        for _ in range(N_TRIALS):
+            t1 = perf_counter()
+            fft2(aperture)
+            t2 = perf_counter()
+
+            time = t2 - t1
+            timing.append(time)
+
+        if i == 0:
+            timing_jax.append(tnp.mean(tnp.array(timing)))
+            err_jax.append(tnp.std(tnp.array(timing)))
+        elif i == 1:
+            timing_tf.append(tnp.mean(tnp.array(timing)))
+            err_tf.append(tnp.std(tnp.array(timing)))
+        elif i == 2:
+            timing_torch.append(tnp.mean(tnp.array(timing)))
+            err_torch.append(tnp.std(tnp.array(timing)))
+        elif i == 3:
+            timing_np.append(tnp.mean(tnp.array(timing)))
+            err_np.append(tnp.std(tnp.array(timing)))
+
+timing = [timing_jax, timing_tf, timing_torch, timing_np]
+err = [err_jax, err_tf, err_torch, err_np]
+
+set_backend_to_numpy()
+plt.figure()
+
+for mean, std, method in zip(timing, err, methods):
+    plt.errorbar(Ns, mean, yerr=std, fmt='o', label=method.__name__, capsize=5)
+
+plt.legend()
+plt.xlabel('Npix')
+plt.ylabel('Time (seconds)')
+plt.title('FFT Performance Comparison')
+plt.show()

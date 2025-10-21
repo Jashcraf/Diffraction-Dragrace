@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+tqdm
+jax
+pytorch
+tensorflow
