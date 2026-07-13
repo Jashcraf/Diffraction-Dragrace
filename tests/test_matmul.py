@@ -21,7 +21,7 @@ from mathops import (
 )
 
 # Define a circle
-Ns = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+Ns = [128, 256, 512, 1024, 2048, 4096]
 N_TRIALS = 100
 methods = [
     set_backend_to_jax,
@@ -97,4 +97,5 @@ plt.legend()
 plt.xlabel('N (for a square N x N matrix)')
 plt.ylabel('Time (seconds)')
 plt.title('Matmul Performance Comparison')
+plt.yscale("log")
 plt.show()
