@@ -1,0 +1,32 @@
+{
+  "package": "prysm",
+  "mode": "backprop",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "n": 128,
+  "n_modes": 11,
+  "focal_pixels": 64,
+  "trials": 5,
+  "time_median_s": 0.032028375018853694,
+  "time_min_s": 0.03127050003968179,
+  "time_all_s": [
+    0.03241129202069715,
+    0.03202791599323973,
+    0.03127050003968179,
+    0.032028375018853694,
+    0.03364895802224055
+  ],
+  "n_iter": 40,
+  "n_feval": 55,
+  "n_jev": 55,
+  "final_cost": 3.357361464324624e-14,
+  "success": true,
+  "phase_rms_error_rad": 7.5595165103323615e-06,
+  "truth_phase_rms_rad": 0.3245434995816609,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64",
+  "mem_peak_mb": 92.90625,
+  "mem_baseline_mb": 62.984375,
+  "mem_footprint_mb": 29.921875,
+  "intensity_dtype": "float64"
+}

@@ -14,6 +14,7 @@ import tensorflow as tf
 from mathops import (
     np,
     fft2,
+    expi,
     sync,
     set_backend_to_jax,
     set_backend_to_tensorflow,
@@ -22,7 +23,7 @@ from mathops import (
 )
 
 # Define a circle
-Ns = [128, 256, 512, 1024, 2048, 4096]
+Ns = [512, 1024, 2048, 4096, 8192]
 N_TRIALS = 5
 methods = [
     set_backend_to_jax,
@@ -80,7 +81,7 @@ for N in Ns:
 
         for _ in range(N_TRIALS):
             t1 = perf_counter()
-            sync(fft2(aperture))
+            sync(expi(aperture))
             t2 = perf_counter()
 
             time = t2 - t1
@@ -111,6 +112,6 @@ for mean, std, method, title in zip(timing, err, methods, backends):
 plt.legend()
 plt.xlabel('Npix')
 plt.ylabel('Time (seconds)')
-plt.title('FFT Performance Comparison')
+plt.title('exp(ix) Performance Comparison')
 plt.yscale("log")
 plt.show()

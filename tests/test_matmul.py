@@ -14,6 +14,7 @@ import tensorflow as tf
 from mathops import (
     np,
     fft2,
+    sync,
     set_backend_to_jax,
     set_backend_to_tensorflow,
     set_backend_to_torch,
@@ -21,13 +22,19 @@ from mathops import (
 )
 
 # Define a circle
-Ns = [128, 256, 512, 1024, 2048, 4096]
-N_TRIALS = 100
+Ns = [512, 1024, 2048, 4096, 8192]
+N_TRIALS = 5
 methods = [
     set_backend_to_jax,
     set_backend_to_tensorflow,
     set_backend_to_torch,
     set_backend_to_numpy,
+]
+backends = [
+    "JAX",
+    "TensorFlow",
+    "PyTorch",
+    "NumPy",
 ]
 
 timing_np = []
@@ -63,9 +70,13 @@ for N in Ns:
         method()
         timing = []
 
+        # Untimed warm-up: the first call pays for JIT tracing/compilation and
+        # kernel selection, which we don't want folded into the mean
+        sync(aperture @ aperture)
+
         for _ in range(N_TRIALS):
             t1 = perf_counter()
-            dump = aperture @ aperture
+            dump = sync(aperture @ aperture)
             t2 = perf_counter()
 
             time = t2 - t1
@@ -90,8 +101,8 @@ err = [err_jax, err_tf, err_torch, err_np]
 set_backend_to_numpy()
 plt.figure()
 
-for mean, std, method in zip(timing, err, methods):
-    plt.errorbar(Ns, mean, yerr=std, fmt='o', label=method.__name__, capsize=5)
+for mean, std, method, title in zip(timing, err, methods, backends):
+    plt.errorbar(Ns, mean, yerr=std, fmt='o', label=title, capsize=5, linestyle="--")
 
 plt.legend()
 plt.xlabel('N (for a square N x N matrix)')

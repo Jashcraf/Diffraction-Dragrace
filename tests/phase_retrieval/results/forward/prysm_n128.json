@@ -1,0 +1,15 @@
+{
+  "package": "prysm",
+  "mode": "loop",
+  "n": 128,
+  "batch": 1,
+  "jit": null,
+  "device_used": "cpu",
+  "device_requested": "cpu",
+  "trials": 7,
+  "time_median_s": 0.00043250000089756213,
+  "throughput_per_s": 2312.138723525345,
+  "mem_peak_mb": 89.578125,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}

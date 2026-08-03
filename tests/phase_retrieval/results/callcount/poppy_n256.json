@@ -1,0 +1,10 @@
+{
+  "package": "POPPY",
+  "label": "POPPY",
+  "n": 256,
+  "calls_per_prop": 9539.1,
+  "primitive_calls_per_prop": 9520.1,
+  "distinct_functions": 369,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}

@@ -1,0 +1,30 @@
+{
+  "package": "HCIPy",
+  "mode": "nograd",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "n": 2048,
+  "n_modes": 11,
+  "focal_pixels": 64,
+  "trials": 3,
+  "time_median_s": 55.96296891698148,
+  "time_min_s": 55.93941954098409,
+  "time_all_s": [
+    55.93941954098409,
+    55.96296891698148,
+    56.1516578750452
+  ],
+  "n_iter": 37,
+  "n_feval": 600,
+  "n_jev": 50,
+  "final_cost": 6.44420397791036e-14,
+  "success": true,
+  "phase_rms_error_rad": 1.0846949614072473e-05,
+  "truth_phase_rms_rad": 0.32561826036690067,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64",
+  "mem_peak_mb": 1011.03125,
+  "mem_baseline_mb": 135.703125,
+  "mem_footprint_mb": 875.328125,
+  "intensity_dtype": "float64"
+}

@@ -1,0 +1,33 @@
+{
+  "package": "dLux",
+  "mode": "nograd",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "n": 256,
+  "n_modes": 11,
+  "focal_pixels": 64,
+  "trials": 3,
+  "time_median_s": 2.8647512909956276,
+  "time_min_s": 2.245428499998525,
+  "time_all_s": [
+    2.245428499998525,
+    2.8647512909956276,
+    3.33623437496135
+  ],
+  "n_iter": 34,
+  "n_feval": 588,
+  "n_jev": 49,
+  "final_cost": 3.439328907563394e-13,
+  "success": true,
+  "phase_rms_error_rad": 2.331675249449698e-05,
+  "truth_phase_rms_rad": 0.3252967468132973,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64",
+  "mem_peak_mb": 1025.265625,
+  "mem_baseline_mb": 205.5625,
+  "mem_footprint_mb": 819.703125,
+  "jax_backend": "cpu",
+  "jit": false,
+  "x64": true,
+  "intensity_dtype": "float64"
+}

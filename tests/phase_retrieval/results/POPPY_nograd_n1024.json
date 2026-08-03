@@ -1,0 +1,29 @@
+{
+  "package": "POPPY",
+  "mode": "nograd",
+  "device_requested": "cpu",
+  "device_used": "cpu",
+  "n": 1024,
+  "n_modes": 11,
+  "focal_pixels": 64,
+  "trials": 1,
+  "time_median_s": 29.705998167046346,
+  "time_min_s": 29.705998167046346,
+  "time_all_s": [
+    29.705998167046346
+  ],
+  "n_iter": 35,
+  "n_feval": 588,
+  "n_jev": 49,
+  "final_cost": 1.4538959727722982e-13,
+  "success": true,
+  "phase_rms_error_rad": 1.455644888321307e-05,
+  "truth_phase_rms_rad": 0.3256073907891363,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64",
+  "mem_peak_mb": 557.78125,
+  "mem_baseline_mb": 130.375,
+  "mem_footprint_mb": 427.40625,
+  "poppy_double_precision": true,
+  "intensity_dtype": "float64"
+}

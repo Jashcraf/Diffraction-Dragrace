@@ -1,0 +1,15 @@
+{
+  "package": "POPPY",
+  "mode": "loop",
+  "n": 256,
+  "batch": 4,
+  "jit": null,
+  "device_used": "cpu",
+  "device_requested": "cpu",
+  "trials": 1,
+  "time_median_s": 0.26183866700012004,
+  "throughput_per_s": 15.27658250719007,
+  "mem_peak_mb": 155.671875,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}

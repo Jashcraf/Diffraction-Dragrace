@@ -1,0 +1,15 @@
+{
+  "package": "HCIPy",
+  "mode": "loop",
+  "n": 512,
+  "batch": 1,
+  "jit": null,
+  "device_used": "cpu",
+  "device_requested": "cpu",
+  "trials": 7,
+  "time_median_s": 0.007306332998268772,
+  "throughput_per_s": 136.8675641032169,
+  "mem_peak_mb": 230.5,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}

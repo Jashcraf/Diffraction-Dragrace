@@ -1,0 +1,15 @@
+{
+  "package": "dLux",
+  "mode": "loop",
+  "n": 256,
+  "batch": 256,
+  "jit": false,
+  "device_used": "cpu",
+  "device_requested": "cpu",
+  "trials": 3,
+  "time_median_s": 1.1028489169984823,
+  "throughput_per_s": 232.12608368581488,
+  "mem_peak_mb": 549.390625,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}

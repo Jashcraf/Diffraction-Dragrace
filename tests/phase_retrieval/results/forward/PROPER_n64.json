@@ -1,0 +1,15 @@
+{
+  "package": "PROPER",
+  "mode": "loop",
+  "n": 64,
+  "batch": 1,
+  "jit": null,
+  "device_used": "cpu",
+  "device_requested": "cpu",
+  "trials": 7,
+  "time_median_s": 0.017852999997558072,
+  "throughput_per_s": 56.01299502250488,
+  "mem_peak_mb": 94.921875,
+  "platform": "macOS-14.5-arm64-arm-64bit",
+  "machine": "arm64"
+}
