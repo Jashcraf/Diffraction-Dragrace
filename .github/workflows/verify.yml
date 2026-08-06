@@ -1,0 +1,70 @@
+# Correctness only. Timing is NEVER run here.
+#
+# Shared GitHub runners are far too noisy for timing, and a timing number
+# produced on one would be indistinguishable in results/ from a good one. The
+# jobs below validate physics, the FLOP model, the adjoint chain and the case
+# schemas -- everything that can be checked without a stopwatch.
+#
+# Propagators are deliberately not installed: they are heavy, several need
+# per-environment BLAS pinning that CI cannot express, and PROPER is not on any
+# package index. Adapters for missing libraries report themselves unsupported
+# rather than failing, so the suite stays green and the gaps stay visible.
+
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the harness only
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Correctness gates
+        run: pytest tests -q
+
+      - name: Baseline adapter runs end to end
+        run: |
+          dragrace doctor
+          python -m dragrace.worker \
+            --case cases/pupil_to_focus/mft_n1024_q4.yaml \
+            --config configs/cpu_numpy_1t.yaml \
+            --adapter numpy_baseline --mode ledger \
+            --out /tmp/dragrace-ci --no-strict-backend
+
+      - name: Assert the accuracy gate actually passed
+        run: |
+          python - <<'PY'
+          import json, sys
+          r = json.load(open("/tmp/dragrace-ci/result.json"))
+          assert r["status"] == "ok", r.get("reason")
+          assert r["accuracy"]["gate"] == "pass", r["accuracy"]
+          print("ok:", r["case_id"], r["accuracy"]["rel_l2"])
+          PY
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src adapters tests --select E9,F63,F7,F82

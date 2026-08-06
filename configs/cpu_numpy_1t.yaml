@@ -1,0 +1,13 @@
+# Single-threaded NumPy baseline. The control: no accelerated FFT, no threading.
+# Every other config is interpreted relative to this one.
+id: cpu_numpy_1t
+device: cpu
+fft_backend: numpy
+blas_backend: openblas
+threads: 1
+conda_env: dragrace
+notes: >
+  mkl_fft must NOT be installed in this environment. Several of these libraries
+  probe for it at import and use it silently, which would convert this control
+  into an MKL run without changing a single line of output. envs/README.md
+  covers why the OpenBLAS and MKL environments are kept separate.

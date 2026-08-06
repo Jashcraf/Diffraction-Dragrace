@@ -1,0 +1,23 @@
+# GPU, single precision. A separate board, opted into explicitly.
+#
+# complex64 is a legitimate 2x memory / roughly 2x throughput lever that prysm
+# and dLux support well. It is NOT a free win, and it must never be inherited
+# by accident -- JAX defaults to single precision, so benchmarking dLux at
+# complex64 against POPPY at complex128 is the single easiest way to publish a
+# meaningless speedup. The harness asserts the realised dtype against the case
+# and fails the run on a mismatch.
+#
+# Accuracy gates are dtype-dependent: single precision bottoms out near 1e-6,
+# so cases used with this config need max_rel_l2 loosened accordingly. Case
+# validation rejects an unreachable combination rather than letting it fail
+# mysteriously at runtime.
+id: gpu_f32
+device: cuda:0
+fft_backend: native
+blas_backend: unknown
+threads: 1
+precision_override: complex64
+conda_env: dragrace-gpu-cupy
+env:
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+  JAX_ENABLE_X64: "0"

@@ -1,0 +1,18 @@
+name: poppy
+status: unverified
+reviewed_by: ""
+source: "poppy>=1.1 (conda-forge)"
+algorithm_classes: [matrix_dft, fft, fresnel_tf]
+devices: [cpu, cuda]      # via poppy.conf.use_cuda -> poppy.accel_math
+fft_backends: [numpy, pyfftw]
+blas_backends: [openblas, mkl]
+precisions: [complex128]
+gradient: {supported: false}
+profiler: viztracer
+notes: >
+  Uses poppy.matrixDFT directly rather than OpticalSystem.calc_psf, which
+  returns an intensity HDUList and bundles detector binning and normalisation
+  into the measurement. POPPY carries astropy.units through much of its optical
+  machinery -- a usability and safety choice with real runtime cost, which the
+  `units` trace category in categories.yaml makes visible. Attribution, not
+  verdict.

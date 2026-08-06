@@ -1,0 +1,72 @@
+# Gradient board -- correctness-gate case (prysm vs dLux).
+#
+# Small on purpose: the finite-difference gate costs 2P forward propagations,
+# so it runs at N=256, P=15, complex128 where central differences are both
+# affordable and numerically trustworthy.
+#
+# PROBLEM DEFINITION
+#   parameters  theta in R^15   Noll Zernikes 4..18, waves RMS, seeded
+#   forward     circular pupil -> basis-rendered OPD -> phasor -> MFT to focus
+#               -> intensity I = |E|^2
+#   loss        L(theta) = mean((I - I_target)^2), I_target = unaberrated PSF
+#   deliverable g = dL/dtheta in R^15
+#
+# Both theta and L are real, so the returned gradient is unambiguously real and
+# the two codes are directly comparable with NO Wirtinger reconciliation. The
+# intermediate complex cotangents *will* differ between prysm's convention and
+# JAX's -- by a conjugation and possibly a factor of 2 -- which is exactly why
+# the board is defined at the parameter level and never compares intermediates.
+#
+# Using intensity rather than the complex field in the loss is deliberate:
+# |.|^2 is precisely the node where the conventions diverge, so it belongs
+# inside the tested path.
+#
+# TIMED REGION: here the basis render and phasor ARE included, unlike the
+# forward board -- they are part of the differentiated chain, and how each
+# framework handles them (cached, rematerialised, fused) is part of what the
+# board measures.
+
+id: grad_zernike_p15_n256
+kind: gradient
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.01
+  samples_across_diameter: 256
+  array_samples: 256
+  aperture: circular
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 4.0
+  extent_lambda_f_d: 16.0      # -> N_f = 64
+
+parameters:
+  basis: zernike_noll
+  count: 15
+  first_noll: 4                # skip piston/tip/tilt
+  amplitude_waves_rms: 0.05
+  seed: 1234                   # every adapter differentiates at the same theta
+
+loss: psf_mse
+dtype: complex128
+basis_caching: precomputed
+
+execution:
+  warmup: 3
+  repeats: 20
+  timeout_s: 600.0
+
+accuracy:
+  reference: internal_mft
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Gate: per-component relative error < 1e-6 against central differences AND
+  cosine similarity > 1 - 1e-9. The cosine check is not redundant -- a uniform
+  factor of 2 (the classic Wirtinger slip) can hide under a loose per-component
+  tolerance while showing up immediately in the scale ratio. dLux at its default
+  complex64 will not pass this gate; run the gate with JAX_ENABLE_X64=1 even if
+  the timing board runs single precision.

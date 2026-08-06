@@ -1,0 +1,42 @@
+# Declared capabilities for the prysm adapter.
+# `dragrace doctor` renders this; the worker verifies it against what actually
+# resolved at runtime and refuses a run on a mismatch.
+
+name: prysm
+status: unverified          # API read from the v0.22 source, not yet run
+reviewed_by: ""             # invite Brandon Dube before publishing results
+source: "git+https://github.com/brandondube/prysm.git"
+minimum_version: "0.22"     # PyPI is at 0.21.1, which predates the adjoint API
+
+algorithm_classes:
+  - matrix_dft              # prepare_executor(kind='mdft') + focus_dft
+  - fft                     # focus(field, Q), norm='ortho'
+  - czt                     # prepare_executor(kind='czt') -- the theoretical
+                            # floor for arbitrary output sampling, and the only
+                            # code in this suite that exposes it
+
+devices: [cpu, cuda]        # via prysm.mathops BackendShim -> cupy
+fft_backends: [numpy, scipy_pocketfft, mkl, pyfftw, native]
+blas_backends: [openblas, mkl]
+precisions: [complex64, complex128]     # prysm.conf.config.precision
+
+gradient:
+  supported: true
+  kind: manual_adjoint      # hand-written reverse chain, no tape, no tracing
+  api:
+    - prysm.polynomials.sum_of_2d_modes / sum_of_2d_modes_adjoint
+    - prysm.propagation.focus_dft / focus_dft_adjoint
+    - prysm.propagation.focus / focus_adjoint
+    - prysm.propagation.angular_spectrum / angular_spectrum_adjoint
+    - prysm.propagation.to_fpm_and_back / to_fpm_and_back_adjoint
+  expected_primitives: 4    # 2 forward GEMMs + 2 adjoint GEMMs -- asserted
+                            # against the ledger so a clumsy hand-written chain
+                            # fails rather than unfairly penalising prysm
+
+profiler: viztracer
+
+notes: >
+  prysm's fttools.fftrange(n) = arange(-(n//2), -(n//2)+n) is identical to the
+  harness grid convention, so no re-centring shim is needed and the two agree to
+  roundoff. Units are mixed: pupil spacing and efl in mm, focal spacing and
+  wavelength in microns.

@@ -1,0 +1,75 @@
+# Diffraction-Dragrace -- GPU environment for dLux (JAX/XLA)
+#
+#   conda env create -f envs/gpu-jax.yml
+#   conda activate dragrace-gpu-jax
+#   bash scripts/setup_env.sh
+#
+# Serves: dLux (forward board + gradient board on GPU)
+#
+# CUDA comes from pip's jax[cuda12] wheels, which vendor their own CUDA
+# libraries. Do not add conda's cuda-version/cupy/cudatoolkit here -- mixing
+# the two loaders is the standard way to end up with JAX silently running on
+# CPU while reporting a GPU device string. Verify after install with:
+#
+#   python -c "import jax; print(jax.devices())"      # -> [CudaDevice(id=0)]
+#
+# TIMING-CRITICAL ENVIRONMENT VARIABLES (set by scripts/setup_env.sh into
+# $CONDA_PREFIX/etc/conda/activate.d/, and re-asserted per-run by the runner):
+#
+#   XLA_PYTHON_CLIENT_PREALLOCATE=false
+#       JAX otherwise grabs ~75% of device memory at first use, which makes
+#       every RSS- or nvidia-smi-based memory number meaningless. With this
+#       off, read peak usage from
+#           jax.local_devices()[0].memory_stats()["peak_bytes_in_use"]
+#
+#   JAX_ENABLE_X64=1
+#       JAX defaults to float32/complex64. Benchmarking dLux at complex64
+#       against POPPY at complex128 is not a comparison. The harness asserts
+#       the realised dtype against the case and fails the run on a mismatch;
+#       this just makes the default the honest one. The complex64 board is
+#       opted into per-config (gpu_f32), not inherited by accident.
+#
+# Config ids served by this env: gpu_f64, gpu_f32 (dlux adapter)
+
+name: dragrace-gpu-jax
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # ---------------------------------------------------------------- BLAS ----
+  - libblas=*=*openblas
+  - openblas
+
+  # ------------------------------------------------------------ numerics ----
+  - numpy>=1.26,<3
+  - scipy>=1.11
+
+  # ------------------------------------------------------------- harness ----
+  - pyyaml>=6.0
+  - psutil
+  - threadpoolctl>=3.2
+  - pandas>=2.0
+  - pyarrow
+  - matplotlib-base>=3.7
+  - rich
+  - tqdm
+  - pytest>=7.4
+
+  - pip:
+      - viztracer>=0.16
+      - vizplugins
+      - "memray>=1.11 ; sys_platform == 'linux'"
+      - "jax[cuda12]>=0.4.35"
+      - dLux>=0.15
+      # prysm is included so the gradient board (prysm vs dLux) can be run
+      # head-to-head in a single env when comparing GPU legs. Note prysm's GPU
+      # path needs CuPy, which is absent here by design -- so in this env prysm
+      # runs CPU-only and the cross-device comparison must be assembled from
+      # two envs by `dragrace report`, which keys results on (adapter, config,
+      # machine) and will not silently merge them.
+      - "prysm @ git+https://github.com/brandondube/prysm.git"

@@ -1,0 +1,16 @@
+# FFTW, single-threaded. Isolates the FFT library from the BLAS: same OpenBLAS
+# as the control, different transform.
+#
+# Planner effort is a large and often-overlooked lever. FFTW_MEASURE can be
+# many times faster than FFTW_ESTIMATE at steady state while costing seconds of
+# planning, so wisdom must be generated in build() and never inside the timed
+# region. PROPER ships prop_fftw_wisdom / prop_load_fftw_wisdom for exactly
+# this; adapters should use them rather than re-planning per call.
+id: cpu_pyfftw_1t
+device: cpu
+fft_backend: pyfftw
+blas_backend: openblas
+threads: 1
+conda_env: dragrace
+env:
+  PYFFTW_PLANNER_EFFORT: FFTW_MEASURE

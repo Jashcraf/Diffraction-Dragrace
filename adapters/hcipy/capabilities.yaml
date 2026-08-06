@@ -1,0 +1,16 @@
+name: hcipy
+status: unverified
+reviewed_by: ""
+source: "hcipy>=0.6 (conda-forge)"
+algorithm_classes: [matrix_dft, fft, fresnel_tf, angular_spectrum]
+devices: [cpu]
+fft_backends: [numpy, mkl, pyfftw]
+blas_backends: [openblas, mkl]
+precisions: [complex128]
+gradient: {supported: false}
+profiler: viztracer
+notes: >
+  HCIPy's FFT layer probes for mkl_fft and pyfftw at import and uses them if
+  present, without saying so. This adapter is what motivated the whole
+  resolve-and-verify mechanism: never install mkl_fft into the OpenBLAS
+  environment, or the "numpy FFT" control silently becomes an MKL run.

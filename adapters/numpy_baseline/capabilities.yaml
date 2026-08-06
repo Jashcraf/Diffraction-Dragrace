@@ -1,0 +1,16 @@
+name: numpy_baseline
+status: verified
+reviewed_by: "harness authors (this is the reference implementation)"
+source: builtin
+algorithm_classes: [matrix_dft, fft]
+devices: [cpu]
+fft_backends: [numpy, scipy_pocketfft, mkl, pyfftw]
+blas_backends: [openblas, mkl]
+precisions: [complex64, complex128]
+gradient: {supported: true, kind: manual_adjoint, expected_primitives: 4}
+profiler: viztracer
+notes: >
+  Not a competitor. Exists so the pipeline is runnable with no propagator
+  installed, so the analytic FLOP model can be validated against an
+  implementation whose every operation is visible, and so the other six have a
+  "what does this cost if you just write it down" floor to be measured against.

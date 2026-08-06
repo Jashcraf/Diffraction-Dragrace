@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dragrace"
+version = "0.1.0"
+description = "Diffraction-Dragrace: standardised benchmarks for open-source physical optics propagators"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+# The harness deliberately depends on NOTHING that any adapter depends on
+# beyond numpy. Propagators are installed per-environment; see environment.yml.
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "threadpoolctl>=3.2",
+    "psutil",
+]
+
+[project.optional-dependencies]
+profile = ["viztracer>=0.16", "vizplugins"]
+report  = ["pandas>=2.0", "matplotlib>=3.7", "pyarrow"]
+dev     = ["pytest>=7.4", "scipy>=1.11"]
+
+[project.scripts]
+dragrace = "dragrace.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]

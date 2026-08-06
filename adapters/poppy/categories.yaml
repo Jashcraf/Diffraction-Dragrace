@@ -1,0 +1,50 @@
+# Trace-attribution categories for POPPY.
+#
+# Self time from the VizTracer trace is mapped to these categories by regex,
+# first match wins; anything unmatched lands in `python_overhead`. The result is
+# a comparable breakdown across codes: how much of a pupil-to-focus propagation
+# is the transform, versus unit handling, array copies and interpreter dispatch.
+#
+# The `units` category is here specifically because POPPY carries astropy
+# Quantities through much of its optical machinery. That is a usability and
+# safety choice with a real runtime cost, and this makes the cost visible.
+# Report it as an attribution, not a verdict -- see docs/methodology.md.
+
+fft:
+  - "numpy\\.fft\\."
+  - "scipy\\.fft\\."
+  - "pyfftw"
+  - "mkl_fft"
+  - "poppy\\.accel_math.*fft"
+
+gemm:
+  - "matrixDFT"
+  - "MatrixFourierTransform"
+  - "perform"
+  - "matmul"
+  - "\\.dot\\b"
+
+elementwise:
+  - "get_phasor"
+  - "get_transmission"
+  - "get_opd"
+  - "\\bexp\\b"
+
+alloc:
+  - "\\bzeros\\b"
+  - "\\bempty\\b"
+  - "asarray"
+  - "\\bcopy\\b"
+  - "pad"
+
+units:
+  - "astropy\\.units"
+  - "\\bQuantity\\b"
+  - "to_value"
+  - "_as_mpl_axes"
+
+coords:
+  - "coordinates"
+  - "meshgrid"
+  - "fftfreq"
+  - "pixelscale"

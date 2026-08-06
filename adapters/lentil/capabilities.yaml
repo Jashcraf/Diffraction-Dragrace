@@ -1,0 +1,15 @@
+name: lentil
+status: unverified
+reviewed_by: ""
+source: "lentil>=0.8.9 (PyPI)"
+algorithm_classes: [matrix_dft]
+devices: [cpu]
+fft_backends: []          # DFT-based: the FFT axis is not applicable
+blas_backends: [openblas, mkl]
+precisions: [complex128]
+gradient: {supported: false}
+profiler: viztracer
+notes: >
+  zgemm-bound rather than FFT-bound. Swapping mkl_fft in does essentially
+  nothing here while swapping OpenBLAS -> MKL does. Insensitivity to the FFT
+  axis in the report is correct and expected, not a broken adapter.

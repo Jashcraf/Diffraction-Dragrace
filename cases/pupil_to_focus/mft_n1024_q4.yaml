@@ -1,0 +1,58 @@
+# Baseline pupil-to-focus, matrix DFT.
+#
+# 1024 samples across a circular pupil, propagated to 4 samples per lambda*F/D
+# over a 32 lambda/D field -> a 128x128 focal grid.
+#
+# Ideal cost (docs/flop_model.md): 8*N_p*N_f*(N_p+N_f)
+#   = 8 * 1024 * 128 * 1152 = 1.208 GFLOP
+# The FFT sibling of this case (fft_n1024_q4) needs 2.013 GFLOP to reach the
+# same sampling, because reaching q=4 costs it a 4096^2 padded transform and it
+# computes the entire field rather than the 32 lambda/D actually asked for.
+# Those two numbers are why algorithm_class is part of the case: they are not
+# the same computation, and ranking them on one axis would be meaningless.
+#
+# TIMED REGION: propagation only. The pupil field (aperture rasterisation and
+# phasor) is built in build(), because this case benchmarks propagators. The
+# gradient board charges for both, since there they are part of the
+# differentiated chain.
+
+id: mft_n1024_q4
+kind: pupil_to_focus
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.01
+  samples_across_diameter: 1024
+  array_samples: 1024          # no pre-padding: an MFT does not need any
+  aperture: circular
+  # Unaberrated, so the analytic Airy physics check is available alongside the
+  # numerical gate. Aberrated variants must use reference=internal_mft.
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 4.0
+  extent_lambda_f_d: 32.0      # -> N_f = 128
+
+dtype: complex128
+basis_caching: precomputed
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 300.0
+
+accuracy:
+  # Gated against the internal double-precision MFT, which shares this case's
+  # discretisation and so agrees to roundoff. The analytic Airy pattern is
+  # reported separately as an ungated physics check: it differs at the ~1e-3
+  # level because it is the continuous-aperture answer while every adapter
+  # propagates a pixelated hard-edged mask. Gating on it would fail everyone.
+  reference: internal_mft
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Reference case for the forward board. Every adapter that supports matrix_dft
+  should pass this; an adapter that cannot reach exactly 128x128 at 4 samples
+  per lambda/D has a sampling-control limitation worth recording in the report.

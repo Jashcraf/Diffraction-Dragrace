@@ -1,0 +1,111 @@
+# Diffraction-Dragrace -- default benchmark environment (CPU, OpenBLAS)
+#
+# Creates one environment able to run every adapter in the suite on CPU:
+#   PROPER, POPPY, HCIPy, prysm, lentil, dLux
+#
+#   conda env create -f environment.yml
+#   conda activate dragrace
+#   bash scripts/setup_env.sh        # local-source installs: PROPER (+ optional prysm)
+#
+# NOTE ON SCOPE
+# This env pins the BLAS to OpenBLAS on purpose. A single conda env cannot
+# express the backend axis of the benchmark matrix -- NumPy links exactly one
+# BLAS, and the CUDA runtimes wanted by CuPy and by JAX do not coexist happily.
+# The variants live in envs/ and are meant to be created alongside this one:
+#
+#   envs/cpu-mkl.yml    MKL-linked NumPy + mkl_fft   (config: cpu_mkl_*)
+#   envs/gpu-cupy.yml   CuPy/CUDA for POPPY + prysm  (config: gpu_*, cupy adapters)
+#   envs/gpu-jax.yml    JAX/CUDA for dLux            (config: gpu_*, dlux adapter)
+#
+# See envs/README.md for the full matrix and which config ids map to which env.
+
+name: dragrace
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # ---------------------------------------------------------------- BLAS ----
+  # Pinned explicitly so every recorded result is attributable. This is not
+  # incidental: the DFT/MFT-based propagators (lentil, prysm's focus_dft,
+  # POPPY's matrixDFT, HCIPy's MatrixFourierTransform) are zgemm-bound, so the
+  # BLAS is the dominant backend variable for them -- not the FFT library.
+  - libblas=*=*openblas
+  - openblas
+
+  # ------------------------------------------------------- MKL FFT runtime ---
+  # NOT INSTALLABLE HERE -- verified by solve, 2026-08-05. conda-forge's `mkl`
+  # package participates in the BLAS mutex, so requesting it forces
+  # libblas=*=*mkl and directly contradicts the OpenBLAS pin above.
+  #
+  # This matters because PROPER's prop_use_ffti() dlopen's libmkl_rt directly
+  # through ctypes (proper/prop_ffti.py + prop_dftidefs.py) and never goes
+  # through NumPy -- so "MKL FFT + OpenBLAS BLAS" is a physically meaningful
+  # configuration that conda simply cannot express. To get it, install the
+  # PyPI MKL runtime, which sits outside conda's mutex:
+  #
+  #     bash scripts/setup_env.sh --intel-fft
+  #
+  # Otherwise PROPER's Intel FFT path is exercised in the dragrace-mkl env
+  # (envs/cpu-mkl.yml), where MKL is both the BLAS and the FFT provider.
+
+  # ------------------------------------------------------------ numerics ----
+  # numpy<3 upper bound is nominal; PROPER 3.3.4 was audited for the NumPy 2
+  # removals (np.float/np.int/np.complex) and is clean, so 2.x is fine.
+  - numpy>=1.26,<3
+  - scipy>=1.11
+  - astropy>=5.3          # PROPER and POPPY both require it
+  - numexpr               # POPPY optional accelerator: poppy.conf.use_numexpr
+  - pyfftw>=0.13          # PROPER prop_use_fftw(); POPPY poppy.conf.use_fftw
+
+  # ------------------------------------------- propagators from conda-forge --
+  - poppy>=1.1
+  - hcipy>=0.6
+  # prysm, lentil, dLux are PyPI-only -- see the pip section below.
+  # PROPER is not on any index; scripts/setup_env.sh installs it from your
+  # local distribution (default: ~/proper_v3.3.4_python).
+
+  # ------------------------------------------------------------- harness ----
+  - pyyaml>=6.0
+  - psutil                # RSS high-water sampling
+  - threadpoolctl>=3.2    # authoritative "which BLAS/OpenMP is really loaded"
+  - pandas>=2.0
+  - pyarrow               # results/index.parquet
+  - matplotlib-base>=3.7
+  - rich                  # CLI tables (dragrace doctor / report)
+  - tqdm
+  - pytest>=7.4
+
+  # Uncomment if your system lacks a C toolchain; PROPER builds three small C
+  # extensions (cubic_conv, cubic_conv_threaded, prop_szoom) at install time.
+  # Verified present on this machine at /usr/bin/gcc, so left off by default.
+  # - c-compiler
+
+  - pip:
+      # ------------------------------------------------------- profiling ---
+      - viztracer>=0.16
+      - vizplugins                        # cpu_usage / memory_usage sampling plugins
+      - "memray>=1.11 ; sys_platform == 'linux'"   # native allocations (FFTW/MKL scratch)
+
+      # ----------------------------------------------------- propagators ---
+      # prysm: installed from git, NOT PyPI. PyPI is at 0.21.1 (checked
+      # 2026-08-05); the gradient board needs the adjoint API introduced in
+      # 0.22 -- focus_dft_adjoint / focus_adjoint / angular_spectrum_adjoint /
+      # to_fpm_and_back_adjoint, in the prysm.propagation *subpackage*. The
+      # forward boards work fine on 0.21.1, so if you want a pinned release
+      # and no gradient board, swap this line for `prysm==0.21.1`.
+      #
+      # For published results, pin a commit rather than tracking master:
+      #     - "prysm @ git+https://github.com/brandondube/prysm.git@<sha>"
+      # To use a local checkout instead:
+      #     bash scripts/setup_env.sh --local-prysm=$HOME/prysm
+      - "prysm @ git+https://github.com/brandondube/prysm.git"
+      - lentil>=0.8.9
+      - dLux>=0.15
+      # dLux pulls jax/jaxlib/equinox/zodiax; pinned here so the CPU env never
+      # silently acquires a CUDA jaxlib. GPU JAX lives in envs/gpu-jax.yml.
+      - "jax[cpu]>=0.4.35"

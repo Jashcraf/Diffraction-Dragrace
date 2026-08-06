@@ -1,0 +1,47 @@
+# Baseline pupil-to-focus, FFT (Fraunhofer).
+#
+# Identical physics to mft_n1024_q4 -- same pupil, same wavelength, same output
+# sampling and field of view -- reached by a different algorithm class. Paired
+# deliberately: the two cases are what make the cross-class comparison
+# ("cost to produce a PSF meeting this spec") possible.
+#
+# Reaching q=4 requires zero-padding to 4*1024 = 4096, so:
+#   ideal cost = 10 * N^2 * log2(N) = 10 * 4096^2 * 12 = 2.013 GFLOP
+# versus 1.208 GFLOP for the MFT. The FFT also computes the full 4096^2 field
+# and then discards all but 128^2 of it. At a wider field of view the ranking
+# inverts -- see the table in docs/flop_model.md.
+
+id: fft_n1024_q4
+kind: pupil_to_focus
+algorithm_class: fft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.01
+  samples_across_diameter: 1024
+  array_samples: 1024          # padding to 4096 is the adapter's job, from q
+  aperture: circular
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 4.0
+  extent_lambda_f_d: 32.0
+
+dtype: complex128
+basis_caching: precomputed
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 300.0
+
+accuracy:
+  reference: internal_mft
+  max_rel_l2: 1.0e-10
+
+notes: >
+  The FFT and MFT paths sample the focal plane at exactly the same coordinates
+  (du = 1/q by construction), so they agree to roundoff. A failure here is
+  almost always a grid-centring convention mismatch rather than a propagation
+  error -- the comparison reports the PSF peak offset in pixels for that reason.

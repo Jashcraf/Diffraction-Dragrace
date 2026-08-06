@@ -1,0 +1,78 @@
+# Diffraction-Dragrace -- GPU environment for the CuPy-backed adapters
+#
+#   conda env create -f envs/gpu-cupy.yml
+#   conda activate dragrace-gpu-cupy
+#   bash scripts/setup_env.sh
+#
+# Serves: POPPY   (poppy.conf.use_cuda -> poppy.accel_math)
+#         prysm   (prysm.mathops BackendShim: np._srcmodule = cupy,
+#                                             fft._srcmodule = cupyx.scipy.fft)
+#
+# JAX IS DELIBERATELY ABSENT. pip's jax[cuda12] wheels vendor their own CUDA
+# runtime libraries, and having those on the same interpreter as conda's CUDA
+# runtime for CuPy is a well-known source of loader conflicts and silent
+# fallbacks to CPU. dLux gets its own env: envs/gpu-jax.yml. This costs nothing
+# -- the runner already launches each adapter in its own interpreter.
+#
+# Adjust cuda-version to match your driver:
+#   nvidia-smi | head -3      # "CUDA Version: 12.x" is the driver's *max*
+#
+# Config ids served by this env: gpu_f64, gpu_f32 (poppy, prysm adapters)
+
+name: dragrace-gpu-cupy
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # ------------------------------------------------------------- CUDA -------
+  - cuda-version=12.6
+  - cupy>=13.3
+  # cuFFT/cuBLAS arrive as cupy dependencies. The plan cache and the NVRTC
+  # kernel cache must both be warmed before timing -- the runner does this in
+  # build(), and CUPY_CACHE_DIR is pinned per-config so a cold NVRTC compile
+  # never lands inside a timed region.
+
+  # ---------------------------------------------------------------- BLAS ----
+  # Host-side BLAS still matters: the CPU legs of these adapters, and any
+  # adapter that falls back to host for part of the chain, use it.
+  - libblas=*=*openblas
+  - openblas
+
+  # ------------------------------------------------------------ numerics ----
+  - numpy>=1.26,<3
+  - scipy>=1.11
+  - astropy>=5.3
+  - numexpr
+  - pyfftw>=0.13
+
+  # ------------------------------------------------------------ propagators --
+  - poppy>=1.1
+  - hcipy>=0.6            # CPU-only, but present so CPU/GPU pairs run in one env
+
+  # ------------------------------------------------------------- harness ----
+  - pyyaml>=6.0
+  - psutil
+  - threadpoolctl>=3.2
+  - pandas>=2.0
+  - pyarrow
+  - matplotlib-base>=3.7
+  - rich
+  - tqdm
+  - pytest>=7.4
+
+  - pip:
+      - viztracer>=0.16
+      - vizplugins
+      - "memray>=1.11 ; sys_platform == 'linux'"
+      - "prysm @ git+https://github.com/brandondube/prysm.git"
+      - lentil>=0.8.9
+      # nvidia-nsight-compute / nsys are NOT pip-installable; install the CUDA
+      # toolkit separately if you want kernel-level GPU trace attribution.
+      # VizTracer on a GPU run measures Python-side dispatch only -- which is
+      # itself the right measurement at small N, where every one of these codes
+      # is launch-bound rather than kernel-bound.

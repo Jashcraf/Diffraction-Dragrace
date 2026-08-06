@@ -1,0 +1,71 @@
+# Diffraction-Dragrace -- CPU environment, MKL-linked NumPy + mkl_fft
+#
+#   conda env create -f envs/cpu-mkl.yml
+#   conda activate dragrace-mkl
+#   bash scripts/setup_env.sh
+#
+# Differs from ../environment.yml in exactly two ways, both deliberate:
+#
+#   1. libblas is pinned to the MKL variant, so NumPy's zgemm -- and therefore
+#      every MFT/DFT-based propagator -- runs on MKL instead of OpenBLAS.
+#   2. mkl_fft is installed, which HCIPy's FFT layer and any scipy.fft backend
+#      shim will pick up.
+#
+# Because #2 happens by *detection* rather than by request in some libraries,
+# never install mkl_fft into the OpenBLAS env: it would silently convert your
+# "numpy FFT" baseline runs into MKL runs. That is the single easiest way to
+# produce wrong conclusions with this suite. `dragrace doctor` cross-checks the
+# resolved backend against the requested one and fails the run on a mismatch.
+#
+# Config ids served by this env: cpu_mkl_1t, cpu_mkl_8t
+
+name: dragrace-mkl
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # ---------------------------------------------------------------- BLAS ----
+  - libblas=*=*mkl
+  - mkl
+  - mkl-service           # runtime thread control / version introspection
+
+  # ------------------------------------------------------------ FFT ---------
+  - mkl_fft               # NumPy/SciPy-compatible MKL FFT front end
+  - pyfftw>=0.13          # kept so pyfftw-vs-mkl is measurable within one env
+
+  # ------------------------------------------------------------ numerics ----
+  - numpy>=1.26,<3
+  - scipy>=1.11
+  - astropy>=5.3
+  - numexpr
+
+  # ------------------------------------------- propagators from conda-forge --
+  - poppy>=1.1
+  - hcipy>=0.6
+
+  # ------------------------------------------------------------- harness ----
+  - pyyaml>=6.0
+  - psutil
+  - threadpoolctl>=3.2
+  - pandas>=2.0
+  - pyarrow
+  - matplotlib-base>=3.7
+  - rich
+  - tqdm
+  - pytest>=7.4
+
+  - pip:
+      - viztracer>=0.16
+      - vizplugins
+      - "memray>=1.11 ; sys_platform == 'linux'"
+      # See ../environment.yml for why prysm comes from git rather than PyPI
+      # (PyPI is at 0.21.1; the gradient board needs the 0.22 adjoint API).
+      - "prysm @ git+https://github.com/brandondube/prysm.git"
+      - lentil>=0.8.9
+      - dLux>=0.15
+      - "jax[cpu]>=0.4.35"

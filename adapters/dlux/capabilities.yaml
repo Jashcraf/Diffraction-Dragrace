@@ -1,0 +1,38 @@
+name: dlux
+status: unverified          # JAX machinery complete; dLux model construction unchecked
+reviewed_by: ""             # invite Louis Desdoigts before publishing results
+source: "dLux>=0.15 (PyPI)"
+
+algorithm_classes: [matrix_dft, fft]
+devices: [cpu, cuda]
+fft_backends: [xla]         # XLA supplies its own; mkl_fft is NOT APPLICABLE --
+                            # this is a declared hole, not a missing feature
+blas_backends: [unknown]    # XLA does not route through NumPy's BLAS
+precisions: [complex64, complex128]   # complex128 requires JAX_ENABLE_X64=1
+
+gradient:
+  supported: true
+  kind: autodiff            # jax.value_and_grad, AOT-compiled
+  exact_flop_counts: true   # compiled.cost_analysis() -- unique in this suite
+  exact_memory: true        # compiled.memory_analysis()
+
+profiler: jax_profiler      # VizTracer sees nothing inside a jitted call: the
+                            # whole propagation is one XLA executable
+
+async_dispatch: true
+sync: "jax.block_until_ready over every pytree leaf"
+
+required_env:
+  JAX_ENABLE_X64: "1"                    # must be set before the first jax import
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false" # or device memory numbers are fiction
+
+notes: >
+  The forward board times a jnp implementation of the case's propagation rather
+  than dLux's OpticalSystem objects, so that what is measured is propagation and
+  not model construction. A dLux-native variant would measure the cost of the
+  framework's abstractions -- also interesting, and it belongs as a separate
+  adapter rather than being silently swapped in here.
+
+  dLux carries overhead specifically to be differentiable. A forward-only board
+  penalises it for a design choice rather than an inefficiency; the gradient
+  board exists partly to correct for that.

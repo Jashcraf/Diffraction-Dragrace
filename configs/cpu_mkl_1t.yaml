@@ -1,0 +1,15 @@
+# MKL for both BLAS and FFT, single-threaded.
+#
+# CAVEAT, and it is a large one on this machine: MKL selects its kernel path
+# from a CPU vendor check and dispatches conservatively on non-Intel parts. The
+# MKL_DEBUG_CPU_TYPE=5 workaround was removed in MKL 2020. On an AMD Zen part,
+# an "OpenBLAS beats MKL" result here is likely measuring MKL's AMD dispatch
+# rather than anything about the propagators. Reproduce on an Intel part before
+# drawing a conclusion; the CPU vendor is recorded in every result and
+# `dragrace report` refuses to plot across machine fingerprints.
+id: cpu_mkl_1t
+device: cpu
+fft_backend: mkl
+blas_backend: mkl
+threads: 1
+conda_env: dragrace-mkl

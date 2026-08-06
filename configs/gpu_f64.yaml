@@ -1,0 +1,23 @@
+# GPU, double precision. Serves poppy/prysm via CuPy (env dragrace-gpu-cupy)
+# and dLux via JAX (env dragrace-gpu-jax) -- two environments, one config id,
+# because the CUDA runtimes cannot share an interpreter.
+#
+# Both backends dispatch asynchronously, so the adapter's sync() is what makes
+# these timings mean anything: cp.cuda.Stream.null.synchronize() for CuPy,
+# jax.block_until_ready over every output leaf for JAX. The harness's
+# sync-scaling guard flags any adapter whose timings fail to grow with problem
+# size, which is the signature of a sync that is not blocking.
+id: gpu_f64
+device: cuda:0
+fft_backend: native          # cuFFT or XLA's own -- not a named CPU library
+blas_backend: unknown        # host BLAS is not the relevant bound here
+threads: 1
+precision_override: complex128
+conda_env: dragrace-gpu-cupy
+env:
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"   # or device memory numbers are fiction
+  JAX_ENABLE_X64: "1"
+notes: >
+  At small N every one of these codes is launch-bound rather than kernel-bound,
+  so VizTracer's Python-side dispatch measurement is the right measurement
+  there. The N-sweep is load-bearing: single-N conclusions on GPU will be wrong.

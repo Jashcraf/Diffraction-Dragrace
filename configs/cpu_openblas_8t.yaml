@@ -1,0 +1,12 @@
+# Threaded OpenBLAS. Isolates threading from backend: pair with cpu_numpy_1t.
+#
+# Most informative for the MFT/DFT-based propagators (lentil, prysm focus_dft,
+# POPPY matrixDFT, HCIPy MatrixFourierTransform), which are zgemm-bound and so
+# scale with BLAS threads. FFT-bound paths respond far less, because numpy.fft
+# is single-threaded regardless of this setting.
+id: cpu_openblas_8t
+device: cpu
+fft_backend: numpy
+blas_backend: openblas
+threads: 8
+conda_env: dragrace

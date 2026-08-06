@@ -1,0 +1,19 @@
+name: proper
+status: unverified
+reviewed_by: ""
+source: "local path install (PyPROPER3 3.3.4); not on PyPI or conda-forge"
+algorithm_classes: [fft, fresnel_tf, angular_spectrum]
+devices: [cpu]
+fft_backends: [numpy, pyfftw, mkl]
+blas_backends: [openblas, mkl]
+precisions: [complex128]
+gradient: {supported: false}
+profiler: viztracer
+requires_env:
+  MKL_DIR: "for prop_use_ffti(); needs the UNVERSIONED libmkl_rt.so symlink"
+notes: >
+  Sampling is set by beam_ratio = 1/q, so PROPER cannot hit an arbitrary focal
+  grid the way an MFT can -- hence no matrix_dft support. Its unit of work is a
+  prescription against module-level global state, so there is nothing to hoist
+  into build() beyond FFTW wisdom and its cold and warm numbers nearly coincide.
+  That is a property of the API, not a measurement artifact.
