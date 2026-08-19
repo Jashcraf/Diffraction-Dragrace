@@ -112,7 +112,20 @@ class PrysmAdapter(Adapter):
                 import pyfftw
                 pyfftw.interfaces.cache.enable()
                 mathops.fft._srcmodule = pfft
-            else:
+            elif config.fft_backend == "numpy":
+                # prysm's own default is scipy.fft, and leaving it there on a
+                # config that asks for numpy is not a neutral choice: the two are
+                # different pocketfft builds, and the whole point of cpu_numpy_1t
+                # is that every adapter transforms through the same one. Pointing
+                # the shim is prysm's documented mechanism for exactly this --
+                # mathops.set_fft_backend_to_mkl_fft() does the same thing one
+                # line over -- so this honours the config axis without deviating
+                # from how prysm is meant to be used. fttools.next_fast_len and
+                # fttools.fftfreq both carry AttributeError fallbacks for
+                # backends that lack them, so numpy.fft is a complete substitute
+                # on this path.
+                mathops.fft._srcmodule = _np.fft
+            else:                                    # scipy_pocketfft, prysm's default
                 mathops.fft._srcmodule = _sfft
 
         pconf.precision = 32 if config.precision_override == "complex64" else 64
@@ -123,15 +136,33 @@ class PrysmAdapter(Adapter):
         self.config_axes_not_selectable = ("blas", "threads") if config.fft_backend == "xla" else ()
         return True
 
+    #: Module name of prysm's FFT shim -> the harness's backend vocabulary.
+    #: Longest match first, so 'mkl_fft._scipy_fft' cannot be read as scipy.
+    _FFT_MODULE_NAMES = (
+        ("mkl_fft", "mkl"),
+        ("pyfftw", "pyfftw"),
+        ("jax", "xla"),
+        ("cupyx", "native"),
+        ("numpy.fft", "numpy"),
+        ("scipy.fft", "scipy_pocketfft"),
+    )
+
     def resolve_backend(self) -> dict:
         from prysm import mathops
         from dragrace.backend import detect_blas
         arr = getattr(mathops.np._srcmodule, "__name__", "?")
         on_xla = "jax" in arr
+        fft_mod = getattr(mathops.fft._srcmodule, "__name__", "?")
+        # Read back what the shim actually points at rather than echoing the
+        # request. Reporting the requested name is how a backend leak survives
+        # into a plotted result: the guard in dragrace.backend.verify can only
+        # catch a mismatch that an adapter is honest enough to report.
+        resolved_fft = next((v for k, v in self._FFT_MODULE_NAMES if fft_mod.startswith(k)),
+                            fft_mod)
         return {
             "array_module": arr,
-            "fft_module": getattr(mathops.fft._srcmodule, "__name__", "?"),
-            "fft_backend": self._fft_name,
+            "fft_module": fft_mod,
+            "fft_backend": resolved_fft,
             "device": "cuda" if "cupy" in arr else "cpu",
             # On XLA there is no BLAS in the path -- XLA emits its own kernels,
             # so naming one would be a label with nothing behind it.
@@ -168,6 +199,20 @@ class PrysmAdapter(Adapter):
             # Q=1: no padding. The case supplies its own guard band, and prysm's
             # default Q=2 would double the transform size to prevent a wraparound
             # that cannot happen here.
+            #
+            # THE TRANSFER FUNCTION IS DELIBERATELY *NOT* HOISTED, even though
+            # prysm lets you: free_space(tf=...) accepts a precomputed kernel and
+            # angular_spectrum_transfer_function's docstring opens "Precompute
+            # the transfer function of free space". Passing it would be bit-
+            # identical and ~7% faster here, and it is still the wrong call to
+            # time. prysm's own tutorial (docs/source/tutorials/Double-Slit
+            # Experiment.ipynb) teaches `wf.free_space(D)`; `tf=` appears only in
+            # a unit test. This board measures how each library is *meant* to be
+            # driven against what that costs, so a per-call kernel rebuild that
+            # the documented path performs is part of prysm's number, exactly as
+            # POPPY is charged for rebuilding its FresnelWavefront and PROPER for
+            # re-executing its whole prescription. Hoisting here would flatter
+            # prysm for an optimisation its users are not taught to reach for.
             state["dz_mm"] = case.propagation.distance_m * 1e3
             return state
         if case.algorithm_class in ("matrix_dft", "czt"):

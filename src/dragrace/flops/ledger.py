@@ -28,6 +28,7 @@ Never active during a timing run: the wrappers add per-call overhead, and
 """
 from __future__ import annotations
 
+import functools
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -97,10 +98,32 @@ class Ledger:
             ],
             "limitations": [
                 "`@` between plain ndarrays bypasses np.matmul and is not counted",
-            ],
+            ] + ([] if self.entries else [
+                "no calls were intercepted: either the library issues none (dLux "
+                "runs one XLA executable -- read compiled.cost_analysis() instead) "
+                "or it bound NumPy's entry points into closures before the "
+                "instrumentation was installed. Do not read flops_total=0 as work "
+                "not done; re-run with `--mode ledger`, which defers the import "
+                "into the patched region."
+            ]),
         }
 
     def render(self) -> str:
+        if not self.entries:
+            # An empty ledger has two very different causes and the reader
+            # cannot tell them apart from a blank table -- which is how HCIPy
+            # silently reported 0 GFLOP for a propagation that ran two FFTs.
+            # A silent zero is worse than a crash, so say both out loud.
+            return (
+                "no instrumented calls were intercepted.\n\n"
+                "  Either the library issues none -- dLux runs the whole "
+                "propagation as a single\n  XLA executable, so this is expected "
+                "and `compiled.cost_analysis()` is the\n  number to read -- or it "
+                "captured NumPy's entry points into closures before\n  the "
+                "instrumentation was installed, in which case the zero is an "
+                "artifact.\n  A library must be imported INSIDE record() to be "
+                "intercepted; see cmd_ledger."
+            )
         lines = [f"{'op':<28} {'shape':<22} {'n':>4} {'GFLOP':>10}"]
         lines.append("-" * 68)
         agg: dict[str, list] = {}
@@ -135,10 +158,66 @@ def _fft_flops(shape: tuple, axes: int) -> float:
     return model.fft_1d(shape[-1])
 
 
+def _preimport_numpy_wrappers() -> None:
+    """Import libraries that capture NumPy's entry points AT IMPORT TIME.
+
+    The patches below replace `np.exp` and `np.fft.fft2` with plain Python
+    functions. Any third party that inspects those objects while being imported
+    must therefore be imported *first*, against pristine NumPy -- otherwise it
+    sees the wrapper and fails, somewhere with no connection to the propagator
+    under test.
+
+    dask does both of the things that break:
+
+        dask.array.ufunc.ufunc.__init__  asserts isinstance(func, np.ufunc),
+                                         which no wrapper can satisfy
+        dask.array.fft.fft_wrap          derives its kind from func.__name__
+                                         (functools.wraps now keeps that right,
+                                         but the ufunc check is unfixable)
+
+    and it is imported transitively by `pyfftw.interfaces`, which both hcipy and
+    poppy pull in. That made `dragrace ledger --adapter hcipy` die with
+    "TypeError: must be an instance of `ufunc`" -- a message about dask, raised
+    from inside HCIPy's import, describing nothing about HCIPy.
+
+    The callers that already import the adapter's library before opening this
+    context (worker.run does, via check_requirements) were never affected. This
+    makes the context safe on its own rather than relying on call order.
+    """
+    try:
+        import dask.array                              # noqa: F401
+    except Exception:                                  # noqa: BLE001
+        pass                                           # not installed: nothing to protect
+
+
+#: The ledger owning the currently-installed patches, if any. Exists so that
+#: record() can nest: worker.run() opens the context before it configures the
+#: adapter (so the library is imported against instrumented NumPy), and
+#: _measure() then opens it again around the propagation without knowing whether
+#: it is the outer one.
+_ACTIVE: Ledger | None = None
+
+
+def active() -> Ledger | None:
+    return _ACTIVE
+
+
 @contextmanager
 def record(patch_scipy: bool = True):
-    """Instrument NumPy/SciPy FFT and GEMM entry points for one computation."""
+    """Instrument NumPy/SciPy FFT and GEMM entry points for one computation.
+
+    Reentrant. A nested call yields the ledger the outer one already owns rather
+    than patching a second time -- double-wrapping would count every call twice
+    and, on exit, restore a wrapper instead of the original function.
+    """
+    global _ACTIVE
     import numpy as np
+
+    if _ACTIVE is not None:
+        yield _ACTIVE
+        return
+
+    _preimport_numpy_wrappers()
 
     led = Ledger()
     patches: list[tuple[Any, str, Any]] = []
@@ -148,6 +227,7 @@ def record(patch_scipy: bool = True):
         if orig is None:
             return
 
+        @functools.wraps(orig)
         def wrapper(a, *args, **kwargs):
             out = orig(a, *args, **kwargs)
             led.entries.append(Entry(
@@ -163,6 +243,7 @@ def record(patch_scipy: bool = True):
         if orig is None:
             return
 
+        @functools.wraps(orig)
         def wrapper(a, b, *args, **kwargs):
             out = orig(a, b, *args, **kwargs)
             sa, sb, so = _shape(a), _shape(b), _shape(out)
@@ -181,6 +262,7 @@ def record(patch_scipy: bool = True):
         if orig is None:
             return
 
+        @functools.wraps(orig)
         def wrapper(a, *args, **kwargs):
             out = orig(a, *args, **kwargs)
             n = float(math.prod(_shape(out)) or 1)
@@ -210,7 +292,9 @@ def record(patch_scipy: bool = True):
                     wrap_fft(sfft, f, 2)
             except Exception:                        # noqa: BLE001
                 pass
+        _ACTIVE = led
         yield led
     finally:
+        _ACTIVE = None
         for mod, fname, orig in reversed(patches):
             setattr(mod, fname, orig)

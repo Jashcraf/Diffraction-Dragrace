@@ -255,8 +255,11 @@ def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict
 
 def run(case, config, adapter_name: str, mode: str,
         out_dir: Path, strict_backend: bool = True) -> dict:
+    import contextlib
+
     from . import adapter as adapter_mod
-    from . import backend, fingerprint
+    from . import fingerprint
+    from .flops import ledger as ledger_mod
 
     res = _result_skeleton(case.id, config.id, adapter_name, mode)
     res["machine"] = fingerprint.machine()
@@ -267,7 +270,14 @@ def run(case, config, adapter_name: str, mode: str,
                            "grid_centering": getattr(ad, "grid_centering", "pixel")})
 
     # ---- support and configuration ----------------------------------------
-    req = ad.check_requirements()
+    # A pure ledger pass defers the library import into the patched region, so
+    # that a code binding np.fft at import time is still intercepted rather than
+    # priced at a silent zero. Every other mode imports here, where a broken
+    # install becomes an honest `unsupported` instead of a traceback. Mode "all"
+    # deliberately keeps the eager import: its timing pass runs first and would
+    # have imported the library anyway, so its ledger block carries the same
+    # caveat as any re-import -- use `--mode ledger` when the ledger is the point.
+    req = ad.check_requirements(deep=(mode != "ledger"))
     if not req:
         res.update(status="unsupported", reason=getattr(req, "reason", "missing requirement"))
         return res
@@ -276,6 +286,28 @@ def run(case, config, adapter_name: str, mode: str,
         res.update(status="unsupported",
                    reason=getattr(sup, "reason", "unsupported"))
         return res
+
+    # For a ledger pass the instrumentation has to be installed before the
+    # library is imported, and configure() is where that import happens. Several
+    # of these codes capture NumPy's entry points at module scope -- PROPER's
+    # prop_ptp.py does `from numpy.fft import fft2, ifft2`, HCIPy's _math/fft.py
+    # closes over `getattr(np.fft, name)` -- so a ledger opened any later than
+    # this prices their transforms at zero. record() is reentrant, so the
+    # narrower context _measure() opens around the propagation still works and
+    # still resets to drop the build's calls.
+    stack = contextlib.ExitStack()
+    with stack:
+        if mode == "ledger":
+            stack.enter_context(ledger_mod.record())
+        return _run_configured(ad, case, config, mode, out_dir, adapter_name,
+                               res, strict_backend)
+
+
+def _run_configured(ad, case, config, mode: str, out_dir: Path, adapter_name: str,
+                    res: dict, strict_backend: bool) -> dict:
+    """Everything from configure() onward, so run() can wrap it in a ledger."""
+    from . import backend
+
     conf = ad.configure(config)
     if not conf:
         res.update(status="unsupported", reason=getattr(conf, "reason", "configure failed"))

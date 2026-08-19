@@ -166,6 +166,18 @@ def cmd_ledger(args, repo: Path) -> int:
     # cache a callable at configure time pick up the instrumented version;
     # their calls are then dropped so only the propagation is priced.
     with ledger_mod.record() as led:
+        # check_requirements() imports the library, and that import belongs
+        # INSIDE the patched context. HCIPy binds NumPy's FFT entry points into
+        # closures while it is being imported (hcipy/_math/fft.py `_make_func`
+        # captures `getattr(np.fft, name)` once, at module scope), so a library
+        # imported beforehand holds the real functions and the ledger records a
+        # silent zero. record() pre-imports the one library that cannot tolerate
+        # being handed a wrapper -- dask -- which is what makes importing the
+        # propagator in here safe.
+        req = ad.check_requirements()
+        if not req:
+            print(f"unsupported: {req.reason}")
+            return 1
         ad.configure(cfg)
         state = ad.build(case, cfg)
         ad.sync(ad.propagate(state))

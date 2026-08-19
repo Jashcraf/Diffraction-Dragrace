@@ -77,7 +77,7 @@ class Adapter(ABC):
     #: and "broken" are different findings and the report must distinguish them.
     requires: tuple[str, ...] = ()
 
-    def check_requirements(self) -> Supported:
+    def check_requirements(self, deep: bool = True) -> Supported:
         """Actually import, rather than just find_spec.
 
         find_spec only proves a module is discoverable on disk. A broken install
@@ -87,6 +87,17 @@ class Adapter(ABC):
         costs nothing extra (the worker is about to import it anyway) and lets
         the three cases be distinguished in the report: not installed, installed
         but broken, and working.
+
+        `deep=False` stops at find_spec, and exists for one caller: the ledger
+        pass. Several libraries bind NumPy's entry points into closures while
+        being imported -- hcipy/_math/fft.py captures `getattr(np.fft, name)` at
+        module scope -- so a library imported before the instrumentation goes on
+        can never be intercepted, and the ledger records a silent zero for a
+        propagation that really ran two FFTs. Deferring the import into the
+        patched region is the only way to price those codes. The cost is that a
+        broken install then surfaces as a traceback from inside build() rather
+        than as a clean `unsupported`, which is an acceptable trade for a
+        diagnostic mode and no trade at all for the timing modes.
         """
         for m in self.requires:
             if importlib.util.find_spec(m) is None:
@@ -94,6 +105,8 @@ class Adapter(ABC):
                     f"not installed: {m}. See envs/README.md for which environment "
                     f"provides it."
                 )
+            if not deep:
+                continue
             try:
                 importlib.import_module(m)
             except Exception as exc:                   # noqa: BLE001

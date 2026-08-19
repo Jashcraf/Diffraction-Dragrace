@@ -79,25 +79,56 @@ class PoppyAdapter(Adapter):
 
     def configure(self, config: Config) -> bool | Unsupported:
         import poppy
+        from poppy import accel_math
 
         self._gpu = config.is_gpu
         self._fft_name = config.fft_backend
         # Toggle names have moved between POPPY versions; set what exists and
         # report what resolved rather than assuming either.
+        #
+        # use_numexpr is deliberately NOT forced. numexpr is a POPPY accelerator
+        # for its elementwise transcendentals, it ships enabled, and no config
+        # axis governs it -- the config owns device, FFT, BLAS and threads. An
+        # adapter switching off an accelerator the library turns on by default
+        # would measure a POPPY nobody runs, which is the same mistake
+        # primitive-v1 made (docs/methodology.md). It honours NUMEXPR_NUM_THREADS,
+        # which the runner sets from the config, so it costs no thread honesty:
+        # measured 3% here, against 44% for the FFT axis below.
         for attr, value in (("use_fftw", config.fft_backend == "pyfftw"),
-                            ("use_cuda", config.is_gpu),
-                            ("use_numexpr", False)):
+                            ("use_mkl", config.fft_backend == "mkl"),
+                            ("use_cuda", config.is_gpu)):
             if hasattr(poppy.conf, attr):
                 try:
                     setattr(poppy.conf, attr, value)
                 except Exception:                    # noqa: BLE001
                     pass
+
+        # THIS LINE IS THE WHOLE POINT OF THE BLOCK ABOVE. accel_math snapshots
+        # conf.use_fftw / use_numexpr / use_mkl into module-level globals at
+        # import time (accel_math.py:69-70) and every FFT dispatch reads the
+        # globals, not conf. Setting conf after import therefore changes nothing,
+        # and POPPY quietly kept using whatever it resolved on import --
+        # pyFFTW, because conf.use_fftw defaults to True and environment.yml
+        # installs pyfftw for PROPER. That put pyFFTW-backed POPPY rows on the
+        # cpu_numpy_1t control board labelled fft_backend='numpy', worth 1.44x
+        # at N=2048 (331 ms against 477 ms), and made cpu_pyfftw_1t and
+        # cpu_numpy_1t the same measurement. update_math_settings() is POPPY's
+        # own public re-read of conf and is what makes the config axis real.
+        try:
+            accel_math.update_math_settings()
+        except Exception as exc:                     # noqa: BLE001
+            return Unsupported(f"poppy.accel_math.update_math_settings() failed: {exc}")
         return True
 
     def resolve_backend(self) -> dict:
         from dragrace.backend import detect_blas
         resolved = {"array_module": "numpy", "device": "cpu",
-                    "fft_backend": self._fft_name, "blas": detect_blas(),
+                    # Read out of accel_math's globals -- the same ones the FFT
+                    # dispatch reads -- rather than echoing the request back.
+                    # Echoing is what let the pyFFTW leak above reach a plot:
+                    # backend.verify can only refuse a mismatch an adapter is
+                    # honest enough to report.
+                    "fft_backend": self._resolved_fft(), "blas": detect_blas(),
                     # Recorded per result rather than left in the source: the
                     # centring convention is the difference between passing the
                     # gate and failing it by a pixel, and a reader of an old
@@ -108,7 +139,8 @@ class PoppyAdapter(Adapter):
             from poppy import accel_math
             resolved["accel_math"] = {
                 k: bool(getattr(accel_math, k, False))
-                for k in ("_USE_FFTW", "_USE_CUPY", "_USE_NUMEXPR", "_USE_OPENCL")
+                for k in ("_USE_FFTW", "_USE_MKL", "_USE_CUPY", "_USE_NUMEXPR",
+                          "_USE_OPENCL")
                 if hasattr(accel_math, k)
             }
             if resolved["accel_math"].get("_USE_CUPY"):
@@ -117,6 +149,23 @@ class PoppyAdapter(Adapter):
         except Exception:                            # noqa: BLE001
             pass
         return resolved
+
+    @staticmethod
+    def _resolved_fft() -> str:
+        """Which FFT POPPY will actually dispatch to, in harness vocabulary.
+
+        Order mirrors the if/elif chain in accel_math.fft_2d, so this reports
+        the branch that will really be taken rather than a plausible guess.
+        """
+        try:
+            from poppy import accel_math
+        except Exception:                            # noqa: BLE001
+            return "unknown"
+        for flag, name in (("_USE_CUPY", "native"), ("_USE_OPENCL", "native"),
+                           ("_USE_MKL", "mkl"), ("_USE_FFTW", "pyfftw")):
+            if getattr(accel_math, flag, False):
+                return name
+        return "numpy"
 
     def build(self, case: Case, config: Config):
         """Untimed: the OpticalSystem a user would build once and reuse."""
