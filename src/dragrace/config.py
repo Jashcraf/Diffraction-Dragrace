@@ -67,9 +67,35 @@ class Config:
             "VECLIB_MAXIMUM_THREADS": n,
         }
 
+    def jax_env(self) -> dict[str, str]:
+        """JAX/XLA settings that must exist before the first `import jax`.
+
+        Both are the config's business rather than the adapter's, and both have
+        to be environment variables because JAX reads them at import and they
+        cannot be changed afterwards.
+
+        x64: JAX defaults to float32/complex64. Benchmarking dLux at single
+        precision against POPPY at double is not a comparison, so the flag
+        follows the config's precision rather than whatever the shell had.
+
+        Threads: OMP_NUM_THREADS does not reach XLA, which runs its own Eigen
+        thread pool sized to the core count. Without this a run labelled
+        `threads=1` could quietly use every core -- the exact mislabelling the
+        backend verifier exists to prevent, arriving through a door it does not
+        watch. (Measured at N_p=1024 the flag makes dLux slightly *faster*,
+        16.4 ms against 18.2, so this costs nothing here; it is about the label
+        being true, not about speed.)
+        """
+        e = {"JAX_ENABLE_X64": "0" if self.precision_override == "complex64" else "1"}
+        if not self.is_gpu:
+            e["XLA_FLAGS"] = (f"--xla_cpu_multi_thread_eigen={'false' if self.threads == 1 else 'true'} "
+                              f"intra_op_parallelism_threads={self.threads}")
+        return e
+
     def full_env(self) -> dict[str, str]:
         e = dict(self.thread_env())
-        e.update(self.env)
+        e.update(self.jax_env())
+        e.update(self.env)          # the config's own env always wins
         return e
 
     def apply_to_environ(self) -> None:

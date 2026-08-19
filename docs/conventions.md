@@ -1,7 +1,8 @@
 # Conventions
 
-Every adapter receives the identical pupil array from `dragrace.grid`. These are
-the conventions that array and the expected output obey.
+Every adapter receives its pupil array from `dragrace.grid` — the same aperture
+rule, the same normalisation, evaluated on the sample positions that adapter
+declares. These are the conventions that array and the expected output obey.
 
 ## Coordinates
 
@@ -18,17 +19,69 @@ x[i] = (i - N_p//2) · dx,    i = 0 … N_p-1
 u[j] = (j - N_f//2) · du,    j = 0 … N_f-1
 ```
 
-Both grids are centred at index `N//2` — the fftshift convention. For even N
-this leaves the grid asymmetric by one sample, which is standard, and is
-consistent between the MFT and FFT paths so the two agree to roundoff rather
-than to half a pixel. `N_f` is forced even for this reason.
+The formulas above are the **`pixel`** convention — the fftshift convention,
+origin on sample `N//2`. For even N this leaves the grid asymmetric by one
+sample, which is standard, and is consistent between the MFT and FFT paths so
+the two agree to roundoff rather than to half a pixel. `N_f` is forced even for
+this reason.
 
-prysm's `fttools.fftrange(n) = arange(-(n//2), -(n//2)+n)` is identical to this,
-so no re-centring shim is needed for that adapter. Adapters whose library centres
-differently must shim in `build()`, not silently return a half-pixel-shifted
-field — `validate.compare` reports the PSF peak offset in pixels precisely to
-catch this, and a failure with a non-zero offset is almost always a centring
-mismatch rather than a propagation error.
+### Two conventions, declared not imposed
+
+A code measured through its documented API does not always get a choice about
+where its samples sit. So each adapter **declares** which convention its output
+obeys, via `grid_centering`, and the harness builds the reference, the injected
+pupil and the coordinate grids to match:
+
+| convention | 1-D grid | on-axis PSF | codes |
+|---|---|---|---|
+| `pixel` (default) | `(i - N//2)·dx` | peaks in one sample | numpy_baseline, prysm, lentil |
+| `interpixel` | `(i - N/2 + 0.5)·dx` | centred on the four-pixel cross | POPPY, dLux |
+| *mixed* | per plane | — | HCIPy (pupil interpixel, focal pixel) |
+
+`grid_centering` is a string when both planes agree, or a mapping
+`{"pupil": ..., "focus": ...}` when they do not. HCIPy needs the second form:
+`make_pupil_grid` places no sample at the origin while `make_focal_grid` does,
+so the two planes genuinely disagree inside one library. Declared as a single
+convention it scores `rel_l2 = 5.9e-3`; declared per plane, `2.3e-15`.
+
+This is not a relaxation. Both are correct discretisations of the same
+continuous problem; the aperture rule, the physics and the rasterisation cost
+are identical, and only the sample positions move by half a step. What it buys
+is that a library which fixes its convention internally can still be gated at
+full strength: POPPY's `OpticalSystem` hard-codes
+`MatrixFourierTransform(centering='ADJUSTABLE')` inside `_propagate_mft` with no
+documented knob reaching it, and dLux's `AngularOpticalSystem` does the same.
+
+The numbers, measured:
+
+| POPPY `calc_psf` compared against | `rel_l2` | peak offset |
+|---|---|---|
+| an `interpixel` reference (its own) | **1.5e-15** | (0, 0) |
+| a `pixel` reference | 0.28 | (-1, -1) |
+| a `pixel` reference, shimmed with `source_offset_r/theta` | 2.3e-2 | (0, 0) |
+
+That last row is why declaring beats shimming. POPPY's source offset is the
+documented way to move a PSF, and it does land the peak correctly — but the
+half-pixel offset lives in the *pupil* grid too, and what survives is a residual
+phase ramp across the focal field that no constant scale factor absorbs. Gating
+that would mean relaxing `max_rel_l2` from 1e-10 to 1e-1 for every adapter, to
+accommodate a mismatch that was never physics.
+
+**Declaring the wrong convention fails loudly**, which is what makes the scheme
+safe: the penalty is 0.28 and a one-pixel peak offset, not a slight degradation
+that could pass unnoticed. The exception to watch is a *one-plane* error, as in
+the HCIPy case above: the peak does not move and only a residual phase ramp
+survives, so it lands at 5.9e-3 — still four orders above the gate, but small
+enough to be mistaken for a tolerance problem and "fixed" by loosening
+`max_rel_l2`. It is a grid error; loosening the gate would hide it.
+
+`validate.compare` reports `peak_offset_px` precisely to catch this class of
+bug. A failure with a non-zero offset is almost always a centring mismatch
+rather than a propagation error; one *without* an offset, at ~1e-3, is usually a
+single plane out of step.
+
+prysm's `fttools.fftrange(n) = arange(-(n//2), -(n//2)+n)` is identical to the
+`pixel` form, so that adapter declares nothing and gets the default.
 
 ## The transform
 

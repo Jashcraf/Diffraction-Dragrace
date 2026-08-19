@@ -54,6 +54,23 @@ class Adapter(ABC):
     #: neutral parties -- see docs/methodology.md on the hand-written-adjoint
     #: confound.
     reviewed_by: str = ""
+    #: Where this code's grids sit: "pixel" (origin on sample N//2, the
+    #: fftshift convention) or "interpixel" (origin between the middle two
+    #: samples). Declared rather than imposed, because several libraries fix it
+    #: internally with no documented knob -- POPPY's OpticalSystem is
+    #: interpixel and cannot be talked out of it. The reference field, the
+    #: injected pupil and the coordinate grids are all built to match, so a code
+    #: is gated on the physics rather than on whose convention it adopted.
+    #: See dragrace.grid and docs/conventions.md.
+    grid_centering: str = "pixel"
+    #: What this code's documented entry point returns, and therefore what the
+    #: accuracy gate can honestly check: "field" (default) or "intensity".
+    #: PROPER's prop_end returns intensity unless asked otherwise, and its focal
+    #: phase carries a residual quadratic curvature from propagating through a
+    #: lens -- so its PSF is right to ~1e-7 while its field fails a field gate.
+    #: Declaring "intensity" gates |E|^2 and marks the row: conjugation and
+    #: scale phase come back null, and it must not feed a phase-sensitive claim.
+    output_quantity: str = "field"
     #: Importable modules this adapter needs. Checked before supports(), so a
     #: library that simply is not installed reports `unsupported` with a clear
     #: reason rather than failing somewhere inside build() -- "not installed"
@@ -125,8 +142,32 @@ class Adapter(ABC):
         return None
 
     def to_host(self, result: Any) -> np.ndarray:
-        """Materialise as a host complex ndarray on the canonical focal grid."""
+        """Materialise `result` on the host, as the library hands it to a user.
+
+        Timed separately from compute. This is whatever the documented call
+        returns -- for a code whose user-facing entry point returns intensity,
+        that is an intensity array, and the accuracy gate reads
+        `complex_field()` instead.
+        """
         return np.asarray(result)
+
+    def complex_field(self, state: Any, result: Any) -> np.ndarray:
+        """Complex focal field for the accuracy gate. NOT timed.
+
+        Defaults to to_host(), which is right for every code whose documented
+        propagation returns a field. It exists for the codes whose documented
+        entry point returns an *intensity* PSF -- POPPY's `calc_psf` returns a
+        FITS HDUList -- where gating on intensity alone would throw away the
+        phase-sign and normalisation diagnostics that make a cross-code
+        comparison meaningful.
+
+        Overriding this is not a licence to compute the answer differently: it
+        must be the same propagation, obtained through whatever the library
+        documents for recovering the field (POPPY: `calc_psf(return_final=True)`).
+        The timed path stays exactly what a user would call, so the extra cost
+        of asking for the field never lands in the measurement.
+        """
+        return self.to_host(result)
 
     def teardown(self, state: Any) -> None:
         return None

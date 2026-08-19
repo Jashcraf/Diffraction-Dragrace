@@ -48,7 +48,13 @@ class PrysmAdapter(Adapter):
         return {"prysm": getattr(prysm, "__version__", "unknown"), "numpy": np.__version__}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
-        if case.algorithm_class not in ("matrix_dft", "fft", "czt"):
+        if case.algorithm_class == "angular_spectrum":
+            return Unsupported(
+                "prysm's Wavefront.free_space applies the paraxial Fresnel transfer "
+                "function, not the exact sqrt form -- it matches an internal_fresnel_tf "
+                "reference to 1.8e-14 and an exact angular-spectrum one only to 4.07e-6. "
+                "Use a fresnel_tf case (fresnel_d50_z1m).")
+        if case.algorithm_class not in ("matrix_dft", "fft", "czt", "fresnel_tf"):
             return Unsupported(f"no prysm path for {case.algorithm_class}")
         if config.is_gpu:
             try:
@@ -69,6 +75,29 @@ class PrysmAdapter(Adapter):
             mathops.np._srcmodule = cp
             mathops.fft._srcmodule = cpfft
             mathops.ndimage._srcmodule = cpndi
+        elif config.fft_backend == "xla":
+            # prysm's backend shim is not CuPy-specific: jax.numpy satisfies the
+            # same array protocol, so pointing the array module at it runs the
+            # whole propagation through XLA with no change to prysm itself.
+            # Verified against the internal reference at rel_l2 = 1.3e-15.
+            #
+            # Not jitted, deliberately. prysm's propagation is written for eager
+            # array APIs; wrapping it in jax.jit would trace through prysm's
+            # Python and measure a different thing from what a prysm user gets
+            # by swapping the backend, which is the documented way to use it.
+            try:
+                import jax.numpy as jnp
+                import jax.scipy.ndimage as jndi
+            except ImportError as exc:
+                return Unsupported(f"XLA config requires JAX ({exc})")
+            mathops.np._srcmodule = jnp
+            mathops.ndimage._srcmodule = jndi
+            try:                       # jax.scipy.fft is partial; leave scipy's
+                import jax.scipy.fft as jfft          # noqa: F401
+                mathops.fft._srcmodule = jfft
+            except ImportError:
+                import scipy.fft as _sfft
+                mathops.fft._srcmodule = _sfft
         else:
             import numpy as _np
             import scipy.fft as _sfft
@@ -88,30 +117,59 @@ class PrysmAdapter(Adapter):
 
         pconf.precision = 32 if config.precision_override == "complex64" else 64
         self._fft_name = config.fft_backend
+        # Set per configure() rather than as a class attribute: prysm honours
+        # the BLAS and thread axes perfectly well on NumPy, and only loses them
+        # when its array module is pointed at XLA.
+        self.config_axes_not_selectable = ("blas", "threads") if config.fft_backend == "xla" else ()
         return True
 
     def resolve_backend(self) -> dict:
         from prysm import mathops
         from dragrace.backend import detect_blas
         arr = getattr(mathops.np._srcmodule, "__name__", "?")
+        on_xla = "jax" in arr
         return {
             "array_module": arr,
             "fft_module": getattr(mathops.fft._srcmodule, "__name__", "?"),
             "fft_backend": self._fft_name,
             "device": "cuda" if "cupy" in arr else "cpu",
-            "blas": "unknown" if self._gpu else detect_blas(),
+            # On XLA there is no BLAS in the path -- XLA emits its own kernels,
+            # so naming one would be a label with nothing behind it.
+            "blas": "unknown" if (self._gpu or on_xla) else detect_blas(),
         }
 
     # ------------------------------------------------------------ lifecycle --
     def build(self, case: Case, config: Config):
-        from prysm.propagation import prepare_executor
+        from prysm.propagation import Wavefront, prepare_executor
 
-        field = pupil_field(case)
+        field = pupil_field(case, centering=self.grid_centering)
         if self._gpu:
             import cupy as cp
             field = cp.asarray(field)
+        elif self._fft_name == "xla":
+            import jax
+            import jax.numpy as jnp
+            field = jax.device_put(jnp.asarray(field))
 
-        state = {"case": case, "field": field, "cls": case.algorithm_class}
+        # The Wavefront object, not the bare array: prysm's documentation,
+        # tutorials and examples all propagate a Wavefront, and it is what
+        # carries dx and wavelength so a user cannot silently mismatch them.
+        # Constructing it is untimed here for the same reason the OpticalSystem
+        # is untimed for POPPY -- it is hoisted out of any real loop. Measured
+        # cost of the wrapper at N_p=1024: 16.5 ms via Wavefront.focus_dft
+        # against 16.8 ms for the module-level focus_dft on a raw array, i.e.
+        # none. prysm's user-facing layer is genuinely free.
+        wf = Wavefront(field, case.wavelength_m * 1e6,      # m -> um
+                       case.dx_pupil_m * 1e3,               # m -> mm
+                       space="pupil")
+
+        state = {"case": case, "field": field, "wf": wf, "cls": case.algorithm_class}
+        if case.algorithm_class == "fresnel_tf":
+            # Q=1: no padding. The case supplies its own guard band, and prysm's
+            # default Q=2 would double the transform size to prevent a wraparound
+            # that cannot happen here.
+            state["dz_mm"] = case.propagation.distance_m * 1e3
+            return state
         if case.algorithm_class in ("matrix_dft", "czt"):
             state["executor"] = prepare_executor(
                 pupil_dx=case.dx_pupil_m * 1e3,          # m -> mm
@@ -129,24 +187,37 @@ class PrysmAdapter(Adapter):
         return state
 
     def propagate(self, state):
-        from prysm.propagation import focus, focus_dft
-
+        """Wavefront methods, which is how prysm documents propagation."""
+        wf = state["wf"]
+        if state["cls"] == "fresnel_tf":
+            return wf.free_space(dz=state["dz_mm"], Q=1)
         if state["cls"] in ("matrix_dft", "czt"):
-            return focus_dft(state["field"], state["executor"])
-        out = focus(state["field"], state["Q"])
+            return wf.focus_dft(state["executor"])
+        out = wf.focus(state["case"].output.focal_length_m * 1e3, state["Q"])
         c, n = state["crop"]
-        return out[c:c + n, c:c + n]
+        return out.data[c:c + n, c:c + n]
 
     def sync(self, result) -> None:
         if self._gpu:
             import cupy as cp
             cp.cuda.Stream.null.synchronize()
+        elif self._fft_name == "xla":
+            # JAX dispatches asynchronously even on CPU. Without this the clock
+            # stops before any arithmetic has happened: the first XLA-backed run
+            # of this adapter reported 0.045 ms for 1.208 GFLOP -- 26 TFLOP/s on
+            # a laptop CPU -- which is dispatch latency, not a record.
+            import jax
+            jax.block_until_ready(result.data if hasattr(result, "data") else result)
 
     def to_host(self, result) -> np.ndarray:
+        # focus_dft returns a Wavefront; the FFT path has already cropped to a
+        # bare array. Both carry the complex field, so no separate
+        # complex_field() override is needed.
+        arr = result.data if hasattr(result, "data") else result
         if self._gpu:
             import cupy as cp
-            return cp.asnumpy(result)
-        return np.asarray(result)
+            return cp.asnumpy(arr)
+        return np.asarray(arr)
 
     def device_memory(self):
         if not self._gpu:

@@ -1,0 +1,84 @@
+# Array-size scan, matrix DFT: runtime as a function of pupil array size.
+#
+# The same physics as mft_n1024_q4 -- 4 samples per lambda*F/D over a 32 lambda/D
+# field, so a 128x128 focal grid -- measured at five pupil array sizes. Every
+# point is measured in ONE worker process, against one configured adapter, and
+# written to a single result.json under a `scan` block. Points measured in
+# separate processes can differ by more than the effect being measured (thread
+# placement, heap state, a machine that got busier), and the curve's *shape* is
+# the entire product of this case.
+#
+# WHY THE FOCAL GRID IS HELD FIXED. N_f stays 128 at every point, so N_p is the
+# only axis moving and the ideal cost is
+#
+#   8*N_p*N_f*(N_p + N_f)  ->  dominated by 8*N_p^2*N_f, i.e. quadratic in N_p
+#
+#   N_p=128    0.034 GFLOP        N_p=1024   1.208 GFLOP
+#   N_p=256    0.101 GFLOP        N_p=2048   4.563 GFLOP
+#   N_p=512    0.336 GFLOP
+#
+# An adapter whose measured curve is steeper than that is doing work the physics
+# does not require -- rebuilding kernel matrices per call is the usual culprit,
+# since those grow as N_p*N_f and would otherwise be hoisted into build(). An
+# adapter whose curve is *flatter* at small N is dispatch-bound, not fast: below
+# N_p ~ 512 the arithmetic is a minority of the runtime, which is why a
+# single-N ranking is untrustworthy and this case exists.
+#
+# The FFT sibling of this scan would be a different curve, not a slower version
+# of this one: reaching q=4 costs an FFT (q*N_p)^2 transform, so its floor grows
+# as N^2 log N and at N_p=2048 it is an 8192^2 array. Scan it as a separate case
+# with its own values, rather than adding algorithm classes to this one.
+#
+# TIMED REGION: propagation only, as in every pupil_to_focus case. The pupil
+# field is rebuilt in build() at each size, untimed but reported as
+# setup.build_s per point -- which is itself worth reading, since build cost
+# grows with N too and decides where the amortisation curves cross.
+
+id: mft_array_scan
+kind: pupil_to_focus
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # A template: samples_across_diameter and array_samples are replaced at each
+  # scan point. Their RATIO is what is held fixed (here 1, no pre-padding --
+  # an MFT does not need any), so an FFT scan declaring 2x pre-padding keeps it
+  # at every size.
+  diameter_m: 0.01
+  samples_across_diameter: 128
+  array_samples: 128
+  aperture: circular
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 4.0
+  extent_lambda_f_d: 32.0      # -> N_f = 128, fixed at every scan point
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil           # n_pupil | n_focus
+  values: [128, 256, 512, 1024, 2048]
+
+execution:
+  # Per point, not per case: the runner multiplies timeout_s by the number of
+  # points. 25 repeats at N_p=2048 is ~3 s of arithmetic on a single core.
+  warmup: 3
+  repeats: 25
+  timeout_s: 300.0
+
+accuracy:
+  # Gated at every point independently. A code that stays accurate at N_p=128
+  # and drifts at 2048 has a conditioning problem worth surfacing, and gating
+  # per point is what turns that into a visible hole in the curve rather than a
+  # timing row that quietly means something different from its neighbours.
+  reference: internal_mft
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Scaling case for the forward board. Plot with `dragrace plot`, which draws
+  runtime against array size on log-log axes with one line per adapter and the
+  ideal-FLOP scaling as a reference slope. Points that fail their accuracy gate
+  are recorded but never plotted.

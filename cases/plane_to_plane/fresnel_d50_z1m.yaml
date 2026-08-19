@@ -1,0 +1,71 @@
+# Plane-to-plane free space, PARAXIAL: the Fresnel transfer function.
+#
+# The sibling of asm_d50_z1m. Identical geometry -- 25.4 mm radius aperture,
+# 632.8 nm, 1 m, N = 2048, N_D = 512, dx = 99.2 um -- and a different kernel:
+#
+#   asm_d50_z1m         H = exp(i k z sqrt(1 - (lam f)^2))     exact
+#   this case           H = exp(i k z) exp(-i pi lam z f^2)     paraxial
+#
+# The second is the first expanded binomially and truncated after the quadratic
+# term. On this geometry the two answers differ by 4.07e-6 -- four orders above
+# the gate -- so a code cannot be measured against the wrong one and be said to
+# have passed or failed on its merits.
+#
+# WHY THIS CASE EXISTS. Running the exact-ASM case first produced a useful
+# surprise: "every propagator supports FFT-based free-space propagation" is
+# true, but they do not all implement the same propagator. prysm's
+# Wavefront.free_space is the paraxial kernel and matches this reference to
+# 1.8e-14, while scoring 4.07e-6 against the exact one. Failing it there would
+# have been the benchmark's error, not prysm's -- its documentation says plainly
+# that free_space uses the Fresnel kernel. So the suite carries both boards and
+# each code runs on the one it actually implements.
+#
+# Reading them together is the point. A code on this board is *not* comparable
+# to a code on the exact board on accuracy -- they are answering different
+# questions -- but the runtimes are directly comparable, since both kernels cost
+# the same two FFTs and one elementwise multiply. Any timing difference between
+# the boards is implementation, not physics.
+#
+# VALIDITY. The paraxial approximation needs the propagation angles to be small:
+# here the maximum spatial frequency on the grid is 1/(2 dx) = 5040 /m, so
+# lam*f_max = 0.0032 rad and the quartic term the expansion drops contributes
+# ~1.3e-4 rad of phase at the array corner. That is why the two kernels disagree
+# at the 1e-6 level rather than the 1e-2 level, and it is a property of this
+# geometry: at a shorter z, or a coarser dx, paraxial would be far worse.
+
+id: fresnel_d50_z1m
+kind: plane_to_plane
+algorithm_class: fresnel_tf
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.0508           # 25.4 mm radius
+  samples_across_diameter: 512
+  array_samples: 2048          # 4 D across, 76.2 mm of guard band per side
+  aperture: circular
+
+propagation:
+  distance_m: 1.0
+
+dtype: complex128
+basis_caching: precomputed
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 300.0
+
+accuracy:
+  # Gated against the paraxial kernel written out in
+  # reference.free_space_transfer_function, on the identical grid, so a code
+  # implementing the Fresnel TF agrees at roundoff. Measured: prysm 1.8e-14.
+  reference: internal_fresnel_tf
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Paraxial free-space board. Pair with asm_d50_z1m, which gates the exact
+  angular-spectrum kernel. An adapter should support whichever of the two its
+  library actually implements and decline the other with a reason -- declining
+  is information, and a code measured against a kernel it never claimed to
+  compute produces a failure that says nothing about the code.

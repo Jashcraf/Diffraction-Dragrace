@@ -89,12 +89,19 @@ class BackendMismatch(RuntimeError):
     pass
 
 
-def verify(config: Config, resolved: dict[str, Any], strict: bool = True) -> list[str]:
+def verify(config: Config, resolved: dict[str, Any], strict: bool = True,
+           not_selectable: tuple[str, ...] = ()) -> list[str]:
     """Compare requested against resolved. Returns warnings; raises on conflict.
 
     A mismatch is a hard failure rather than a warning because a mislabelled
     result is worse than no result: it survives into the report, gets plotted,
     and nobody can tell by looking.
+
+    `not_selectable` names axes the adapter has declared it cannot honour --
+    dLux supplies its own XLA kernels and has no FFT or BLAS to choose. Those
+    axes are downgraded from failure to a loud warning rather than exempted
+    quietly: the run is legitimate (it is the only backend that code has), but
+    it does NOT belong in a backend comparison, and every result says so.
     """
     problems: list[str] = []
     warnings: list[str] = []
@@ -102,18 +109,28 @@ def verify(config: Config, resolved: dict[str, Any], strict: bool = True) -> lis
     got_blas = resolved.get("blas") or detect_blas()
     if config.blas_backend != "unknown" and got_blas != "unknown":
         if got_blas != config.blas_backend:
-            problems.append(
-                f"BLAS: requested {config.blas_backend!r}, threadpoolctl reports {got_blas!r}"
-            )
+            msg = f"BLAS: requested {config.blas_backend!r}, threadpoolctl reports {got_blas!r}"
+            (warnings if "blas" in not_selectable else problems).append(msg)
+    if "blas" in not_selectable:
+        warnings.append(
+            f"BLAS axis is not selectable for this adapter; the config's "
+            f"{config.blas_backend!r} did not apply and this row is not comparable "
+            f"along the BLAS axis."
+        )
 
     got_fft = resolved.get("fft_backend")
     if got_fft and got_fft != config.fft_backend:
         # 'native' and 'xla' mean "whatever the device path uses" and are not
         # expected to match a named CPU library.
         if config.fft_backend not in ("native", "xla"):
-            problems.append(
-                f"FFT: requested {config.fft_backend!r}, adapter resolved {got_fft!r}"
-            )
+            msg = f"FFT: requested {config.fft_backend!r}, adapter resolved {got_fft!r}"
+            if "fft" in not_selectable:
+                warnings.append(
+                    msg + " -- this adapter has no selectable FFT backend, so the "
+                          "config's FFT axis did not apply to this run."
+                )
+            else:
+                problems.append(msg)
 
     got_device = str(resolved.get("device", "")).lower()
     if got_device:
@@ -123,6 +140,21 @@ def verify(config: Config, resolved: dict[str, Any], strict: bool = True) -> lis
             problems.append(
                 f"device: requested {config.device!r}, adapter resolved {got_device!r}"
             )
+
+    if "threads" in not_selectable:
+        # threadpoolctl only sees OpenMP/BLAS runtimes. An XLA-backed run has
+        # neither in its path, so a "1 thread" reading there describes NumPy
+        # sitting idle in the same process and says nothing about the code being
+        # measured. Recorded as unverified rather than left to look checked:
+        # XLA_FLAGS=--xla_cpu_multi_thread_eigen/intra_op_parallelism_threads
+        # produced identical timings at 1 and 8 threads when this was tested, so
+        # the harness cannot currently prove the thread count either way.
+        warnings.append(
+            f"thread axis is not verifiable for this adapter: it runs on XLA, "
+            f"which threadpoolctl cannot see. The config's threads={config.threads} "
+            f"is a label, not a measured property, and this row must not be used "
+            f"for a thread-scaling comparison."
+        )
 
     # A run labelled threads=1 that actually used 24 is a mislabelled result, so
     # a mismatch on the *active* BLAS is fatal. Other loaded runtimes (an idle
@@ -134,7 +166,7 @@ def verify(config: Config, resolved: dict[str, Any], strict: bool = True) -> lis
             continue
         msg = (f"thread count: {e['api']} reports {e['threads']} threads, config asked "
                f"for {config.threads}  [{e['path']}]")
-        if e["api"] == active:
+        if e["api"] == active and "threads" not in not_selectable:
             problems.append(
                 msg + "\n    The active BLAS is not honouring the requested thread count. "
                       "This usually means NumPy was imported before the config's "
@@ -155,9 +187,13 @@ def verify(config: Config, resolved: dict[str, Any], strict: bool = True) -> lis
     return warnings + problems
 
 
-def snapshot(config: Config, resolved: dict[str, Any]) -> dict[str, Any]:
+def snapshot(config: Config, resolved: dict[str, Any],
+             not_selectable: tuple[str, ...] = ()) -> dict[str, Any]:
     """The `backend` block recorded in every result.json."""
     return {
+        # Axes the adapter declared it cannot honour. Recorded at the top of the
+        # block because it changes how every other field in it should be read.
+        "axes_not_selectable": list(not_selectable),
         "requested": {
             "fft": config.fft_backend,
             "blas": config.blas_backend,

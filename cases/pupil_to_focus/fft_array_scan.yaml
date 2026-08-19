@@ -1,0 +1,84 @@
+# Array-size scan, FFT path: runtime as a function of pupil array size.
+#
+# The FFT sibling of mft_array_scan, and deliberately a separate case rather
+# than a variant of it. Reaching q = 4 samples per lambda*F/D costs an FFT a
+# (q*N_p)^2 padded transform, so the two algorithm classes have genuinely
+# different curves and ranking them on one axis would be meaningless:
+#
+#   N_p     MFT floor      FFT floor      FFT transform
+#   64      0.0126 GFLOP   0.0052 GFLOP   256^2
+#   128     0.0336 GFLOP   0.0236 GFLOP   512^2
+#   256     0.1007 GFLOP   0.1049 GFLOP   1024^2
+#   512     0.3355 GFLOP   0.4614 GFLOP   2048^2
+#   1024    1.2080 GFLOP   2.0133 GFLOP   4096^2
+#
+# The FFT is *cheaper* at small N -- a 256^2 transform beats two GEMMs against a
+# 128-sample focal grid -- and loses from N_p = 256 upward, because it computes
+# the entire field where the MFT computes only the 32 lambda/D actually asked
+# for. That crossover is the whole reason both cases exist.
+#
+# WHY IT STOPS AT 1024. The padded transform is the binding constraint, not the
+# pupil: N_p = 1024 already means a 4096^2 complex128 array, 268 MB per copy and
+# several copies live inside a Fresnel propagator. N_p = 2048 would need 8192^2,
+# over a gigabyte per array, which is a memory benchmark rather than a
+# propagation one.
+#
+# WHO CAN RUN IT. This is the board PROPER can join: PROPER is FFT/Fresnel-based
+# and has no matrix-DFT path at all -- its sampling is set by beam_ratio, so it
+# cannot hit an arbitrary focal grid the way an MFT can, and it is `unsupported`
+# on mft_array_scan for that reason rather than for want of an install.
+# numpy_baseline, prysm, POPPY, HCIPy and dLux all support the fft class too.
+
+id: fft_array_scan
+kind: pupil_to_focus
+algorithm_class: fft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # Template; samples_across_diameter and array_samples are replaced per scan
+  # point, their ratio (1, no pre-padding) held fixed. The FFT's own padding to
+  # q*N_p is a property of the algorithm class, not of the case.
+  diameter_m: 0.01
+  samples_across_diameter: 64
+  array_samples: 64
+  aperture: circular
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 4.0
+  extent_lambda_f_d: 32.0      # -> N_f = 128, fixed at every scan point
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil
+  values: [64, 128, 256, 512, 1024]
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 600.0             # per point; a 4096^2 transform is not quick
+
+accuracy:
+  # 1e-6, not the 1e-10 the MFT cases use, and the reason is physical rather
+  # than administrative. A code that reaches the focal plane by propagating
+  # through a lens -- PROPER's prop_lens + prop_propagate -- accumulates
+  # roundoff through large phase factors and lands near 1e-8, where an
+  # FFT-of-the-pupil lands at 1e-15. Gating at 1e-10 would exclude every
+  # Fresnel-based code from its own board while telling the reader nothing
+  # about the physics.
+  #
+  # The gate is a floor for "did you compute the right thing", not a ranking.
+  # Every point records its own rel_l2, so a reader sees at a glance who sits at
+  # 1e-15 and who at 1e-8 -- and that difference is worth reading, since it is
+  # the price of the more general propagator.
+  reference: internal_mft
+  max_rel_l2: 1.0e-6
+
+notes: >
+  Scaling case for the FFT path, and the only forward scan PROPER can join.
+  Compare its curve against mft_array_scan on the same machine: the MFT computes
+  only the requested field of view while the FFT computes all of it, so the gap
+  widens with N rather than staying a constant factor.

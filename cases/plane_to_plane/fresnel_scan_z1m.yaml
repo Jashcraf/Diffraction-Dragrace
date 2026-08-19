@@ -1,0 +1,79 @@
+# Plane-to-plane free space, PARAXIAL, scanned over array size.
+#
+# The scan sibling of fresnel_d50_z1m: same 25.4 mm radius aperture, same
+# 632.8 nm, same 1 m, same Fresnel transfer function, measured at five grids.
+# This is the board with the most codes on it -- five of the seven adapters run
+# here, against two on the exact-ASM board and three or four on the focal ones --
+# because free space is the one geometry every library agrees how to express.
+#
+# WHAT IS SCANNED. The scan value is the array size N; the aperture follows at
+# N/4, holding the guard band fixed at 1.5 D per side:
+#
+#   array N    N_D     dx         transform
+#      256      64    793.8 um    256^2
+#      512     128    396.9 um    512^2
+#     1024     256    198.4 um    1024^2
+#     2048     512     99.2 um    2048^2      <- fresnel_d50_z1m
+#     4096    1024     49.6 um    4096^2
+#
+# Holding the guard band at a fixed fraction rather than a fixed width is what
+# keeps the physics constant along the scan: every point sees the same aperture,
+# the same distance and the same 4 D window, sampled more finely. Only the
+# discretisation moves, which is what makes the curve a statement about the
+# codes rather than about five different problems.
+#
+# SAMPLING IS VALID AT EVERY POINT, and this needed checking rather than
+# assuming -- the two constraints move in opposite directions as N grows:
+#
+#   array N   dx        needs dx >= sqrt(lam z/N)   spread    guard
+#      256     793.8um   49.72um   ok                0.40mm    76.2mm
+#      512     396.9um   35.16um   ok                0.80mm    76.2mm
+#     1024     198.4um   24.86um   ok                1.59mm    76.2mm
+#     2048      99.2um   17.58um   ok                3.19mm    76.2mm
+#     4096      49.6um   12.43um   ok                6.38mm    76.2mm
+#
+# The margin on the transfer-function criterion shrinks from 16x to 4x across
+# the scan; going one octave further (N_D = 2048, dx = 24.8 um) would still pass
+# but the 8192^2 transform is a gigabyte per array, so the scan stops here.
+#
+# The ideal cost is 2 FFTs plus one elementwise multiply at every point, so the
+# floor grows as N^2 log N -- 0.007 GFLOP at 256^2 to 4.4 GFLOP at 4096^2.
+
+id: fresnel_scan_z1m
+kind: plane_to_plane
+algorithm_class: fresnel_tf
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.0508           # 25.4 mm radius
+  samples_across_diameter: 64  # template; replaced per scan point
+  array_samples: 256           # ratio 4 is what is held fixed, not this number
+  aperture: circular
+
+propagation:
+  distance_m: 1.0
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil
+  values: [256, 512, 1024, 2048, 4096]   # array size; aperture is N/4
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 600.0             # per point; the 4096^2 point is not quick
+
+accuracy:
+  # Paraxial kernel, gated per point against the same kernel written out in
+  # reference.free_space_transfer_function. Five codes reach ~1e-13 here.
+  reference: internal_fresnel_tf
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Free-space scan. numpy_baseline, prysm, POPPY, PROPER and dLux all implement
+  the paraxial transfer function and run here. HCIPy matches neither canonical
+  kernel and lentil has no free-space propagator at all, so both decline with a
+  reason rather than appearing as holes.

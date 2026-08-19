@@ -11,6 +11,13 @@ Modes are separate passes over the same case on purpose:
   ledger    one iteration with FFT/GEMM entry points instrumented.
   trace     one iteration under VizTracer (or jax.profiler). Stamped traced=true.
   gradient  the prysm-vs-dLux board.
+
+A case carrying a `scan:` block is the one exception to "one run, one
+measurement": it expands into one concrete case per array size, all measured in
+this process and written to a single result.json under a `scan` block. Every
+point then shares one machine fingerprint and one verified backend, so the slope
+of the resulting curve is a property of the code rather than of the machine's
+mood between two invocations.
 """
 from __future__ import annotations
 
@@ -25,10 +32,26 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
+#: What the timed region means. Bumped whenever that definition changes, because
+#: two results measured under different contracts are not comparable and nothing
+#: else in the file would say so -- the schema is identical, the adapter name is
+#: identical, only the meaning moved.
+#:
+#:   primitive-v1   the timed call was the library's transform entry point
+#:                  (poppy.matrixDFT, lentil.fourier.dft2, a hand-written jnp
+#:                  kernel for dLux).
+#:   idiomatic-v1   the timed call is the one the library's own documentation
+#:                  puts in front of a user (OpticalSystem.calc_psf,
+#:                  Wavefront.focus_dft, propagate_dft, propagate_mono), with
+#:                  everything the API permits hoisting already hoisted into
+#:                  build(). See docs/methodology.md.
+MEASUREMENT_CONTRACT = "idiomatic-v1"
+
 
 def _result_skeleton(case_id: str, config_id: str, adapter_name: str, mode: str) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
+        "measurement_contract": MEASUREMENT_CONTRACT,
         "case_id": case_id,
         "config_id": config_id,
         "mode": mode,
@@ -37,45 +60,22 @@ def _result_skeleton(case_id: str, config_id: str, adapter_name: str, mode: str)
     }
 
 
-def run(case, config, adapter_name: str, mode: str,
-        out_dir: Path, strict_backend: bool = True) -> dict:
+def _measure(ad, case, config, mode: str, out_dir: Path, adapter_name: str,
+             tag: str = "") -> dict:
+    """Everything downstream of the case: build, first call, gate, mode dispatch.
+
+    Split out from run() so that a scan case can call it once per array size
+    against an adapter that was configured and backend-verified exactly once.
+    Returns the result blocks for one concrete case rather than mutating a
+    result, because a scan needs N of them side by side in one file.
+    """
     import numpy as np
 
-    from . import adapter as adapter_mod
-    from . import backend, fingerprint, metrics, validate
+    from . import metrics, validate
     from .flops import ideal_work, gradient_ideal_work, efficiency, ledger as ledger_mod
     from .reference import reference_field, airy_field, loss_and_reference_gradient
 
-    res = _result_skeleton(case.id, config.id, adapter_name, mode)
-    res["machine"] = fingerprint.machine()
-    res["provenance"] = fingerprint.provenance()
-
-    ad = adapter_mod.get(adapter_name)
-    res["adapter"].update({"status": ad.status, "reviewed_by": ad.reviewed_by})
-
-    # ---- support and configuration ----------------------------------------
-    req = ad.check_requirements()
-    if not req:
-        res.update(status="unsupported", reason=getattr(req, "reason", "missing requirement"))
-        return res
-    sup = ad.supports(case, config)
-    if not sup:
-        res.update(status="unsupported",
-                   reason=getattr(sup, "reason", "unsupported"))
-        return res
-    conf = ad.configure(config)
-    if not conf:
-        res.update(status="unsupported", reason=getattr(conf, "reason", "configure failed"))
-        return res
-
-    res["adapter"]["versions"] = ad.versions()
-    resolved = ad.resolve_backend()
-    res["backend"] = backend.snapshot(config, resolved)
-    try:
-        res["backend"]["warnings"] = backend.verify(config, resolved, strict=strict_backend)
-    except backend.BackendMismatch as exc:
-        res.update(status="backend_mismatch", reason=str(exc))
-        return res
+    res: dict[str, Any] = {}
 
     # ---- build (untimed) ---------------------------------------------------
     is_grad = (mode == "gradient")
@@ -105,7 +105,8 @@ def run(case, config, adapter_name: str, mode: str,
             loss, grad = first
             theta = getattr(ad, "gradient_theta", lambda s: None)(state)
             if theta is not None:
-                ref_loss, ref_grad = loss_and_reference_gradient(case, np.asarray(theta))
+                ref_loss, ref_grad = loss_and_reference_gradient(
+                    case, np.asarray(theta), getattr(ad, "grid_centering", "pixel"))
                 gc = validate.compare_gradients(np.asarray(grad), ref_grad)
                 res["gradient_accuracy"] = gc.to_dict()
                 res["gradient_accuracy"]["reference"] = "central_differences"
@@ -126,12 +127,19 @@ def run(case, config, adapter_name: str, mode: str,
             return res
 
         # ---- forward board: accuracy first ---------------------------------
-        out = ad.to_host(first)
+        # complex_field() rather than to_host(): a code whose documented entry
+        # point returns an intensity PSF still has to be gated on phase, and the
+        # cost of asking it for the field must not land in the timing.
+        centering = getattr(ad, "grid_centering", "pixel")
+        quantity = getattr(ad, "output_quantity", "field")
+        compare = validate.compare_intensity if quantity == "intensity" else validate.compare
+        out = ad.complex_field(state, first)
         metrics.verify_dtype(out, case)
-        cmp_ = validate.compare(out, reference_field(case), case)
+        cmp_ = compare(out, reference_field(case, centering), case)
         res["accuracy"] = cmp_.to_dict()
+        res["accuracy"]["grid_centering"] = centering
         if not case.pupil.aberration.coefficients:
-            phys = validate.compare(out, airy_field(case), case)
+            phys = compare(out, airy_field(case, centering), case)
             res["accuracy"]["physics_check_analytic_airy"] = {
                 "rel_l2": phys.rel_l2, "peak_ratio": phys.peak_ratio,
                 "note": ("ungated: the analytic Airy pattern is the continuous-aperture "
@@ -173,7 +181,7 @@ def run(case, config, adapter_name: str, mode: str,
 
         if mode == "trace":
             from . import tracing, trace_summary
-            tpath = out_dir / "trace.json"
+            tpath = out_dir / f"trace{tag}.json"
             with tracing.trace(tpath):
                 ad.sync(ad.propagate(state))
             res["trace"] = {"path": str(tpath), "tool": "viztracer", "mode": "full"}
@@ -191,6 +199,110 @@ def run(case, config, adapter_name: str, mode: str,
             ad.teardown(state)
         except Exception:                              # noqa: BLE001
             pass
+
+
+def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict:
+    """Measure every point of a scan case into one `scan` block.
+
+    A point that fails is recorded and the scan continues. The alternative --
+    aborting the file -- throws away every size that did measure cleanly, and
+    the usual reason a large point fails (memory) is itself the finding.
+    """
+    points = []
+    for sub in case.scan_cases():
+        value = getattr(sub, case.scan.parameter)
+        point: dict[str, Any] = {
+            "scan_value": value,
+            "case_id": sub.id,
+            "n_pupil": sub.n_pupil,
+            "n_across": sub.n_across,
+            "n_focus": sub.n_focus,
+        }
+        try:
+            point.update(_measure(ad, sub, config, mode, out_dir, adapter_name,
+                                  tag=f"_{case.scan.parameter}{value}"))
+        except Exception as exc:                       # noqa: BLE001
+            point.update(status="failed", reason=f"{type(exc).__name__}: {exc}",
+                         traceback=traceback.format_exc())
+        points.append(point)
+
+    ok = [p for p in points if p.get("status") == "ok"]
+    if len(ok) == len(points):
+        status, reason = "ok", None
+    elif ok:
+        # Deliberately not "ok": a curve with holes in it must not be read as a
+        # complete measurement just because most of its points landed.
+        status = "partial"
+        reason = ("scan incomplete: " + ", ".join(
+            f"{p['scan_value']}={p.get('status')}" for p in points
+            if p.get("status") != "ok"))
+    else:
+        status = points[0].get("status", "failed")
+        reason = points[0].get("reason")
+
+    res: dict[str, Any] = {
+        "scan": {
+            "parameter": case.scan.parameter,
+            "values": [p["scan_value"] for p in points],
+            "points": points,
+        },
+        "status": status,
+    }
+    if reason:
+        res["reason"] = reason
+    return res
+
+
+def run(case, config, adapter_name: str, mode: str,
+        out_dir: Path, strict_backend: bool = True) -> dict:
+    from . import adapter as adapter_mod
+    from . import backend, fingerprint
+
+    res = _result_skeleton(case.id, config.id, adapter_name, mode)
+    res["machine"] = fingerprint.machine()
+    res["provenance"] = fingerprint.provenance()
+
+    ad = adapter_mod.get(adapter_name)
+    res["adapter"].update({"status": ad.status, "reviewed_by": ad.reviewed_by,
+                           "grid_centering": getattr(ad, "grid_centering", "pixel")})
+
+    # ---- support and configuration ----------------------------------------
+    req = ad.check_requirements()
+    if not req:
+        res.update(status="unsupported", reason=getattr(req, "reason", "missing requirement"))
+        return res
+    sup = ad.supports(case, config)
+    if not sup:
+        res.update(status="unsupported",
+                   reason=getattr(sup, "reason", "unsupported"))
+        return res
+    conf = ad.configure(config)
+    if not conf:
+        res.update(status="unsupported", reason=getattr(conf, "reason", "configure failed"))
+        return res
+
+    res["adapter"]["versions"] = ad.versions()
+    resolved = ad.resolve_backend()
+    not_selectable = tuple(getattr(ad, "config_axes_not_selectable", ()))
+    res["backend"] = backend.snapshot(config, resolved, not_selectable)
+    try:
+        res["backend"]["warnings"] = backend.verify(
+            config, resolved, strict=strict_backend, not_selectable=not_selectable)
+    except backend.BackendMismatch as exc:
+        res.update(status="backend_mismatch", reason=str(exc))
+        return res
+
+    # ---- measure ------------------------------------------------------------
+    # A scan case is measured point by point in this same process, against the
+    # adapter configured and backend-verified above. Every point therefore
+    # shares one machine fingerprint and one resolved backend, which is what
+    # makes the *shape* of the curve a property of the code rather than of
+    # whatever else the machine was doing between two separate runs.
+    if case.is_scan:
+        res.update(_scan(ad, case, config, mode, out_dir, adapter_name))
+    else:
+        res.update(_measure(ad, case, config, mode, out_dir, adapter_name))
+    return res
 
 
 def main(argv: list[str] | None = None) -> int:

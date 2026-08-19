@@ -1,0 +1,108 @@
+# Plane-to-plane free-space propagation: a 2-inch aperture, one metre downstream.
+#
+# A 25.4 mm radius circular aperture illuminated at 632.8 nm (HeNe) and
+# propagated 1 m by the angular spectrum of plane waves. No lens, no focal
+# plane, no magnification -- the observation grid IS the illumination grid.
+#
+# WHY THIS IS A FAIRER COMPARISON THAN PUPIL-TO-FOCUS. On the forward board each
+# code has to be talked into producing the harness's focal sampling, and they
+# disagree about how: POPPY wants arcsec per pixel, prysm wants microns, lentil
+# wants metres, PROPER cannot hit an arbitrary grid at all and is excluded from
+# the MFT board entirely. Free-space transfer-function propagation has no such
+# argument. Every one of the six exposes it, the output sampling equals the
+# input sampling by construction, and so the only thing left to differ is how
+# each code computes exp(i k z sqrt(1 - (lam f)^2)) and applies it. That is as
+# close to a like-for-like kernel comparison as this suite gets.
+#
+# THE GEOMETRY, AND WHAT IT COSTS TO SAMPLE
+#
+#   D = 50.8 mm, lambda = 632.8 nm, z = 1 m
+#   Fresnel number  N_F = a^2/(lambda z) = 1020      -- deep near field
+#
+# At N_F ~ 1000 this is nothing like a PSF: the pattern is essentially the
+# geometric shadow of the aperture with fine ringing at its edge. Two sampling
+# constraints decide the grid, and they pull in opposite directions.
+#
+#   1. The transfer function must be sampled: dx >= sqrt(lambda z / N).
+#      At N = 2048 that is dx >= 17.6 um. Violate it and the quadratic phase
+#      aliases, which does not fail loudly -- it returns a plausible wrong
+#      answer, which is the worst kind.
+#   2. The diffracted field must not wrap. Energy walks about
+#      lambda*z/(2 dx) = 3.2 mm, so the guard band has to exceed that.
+#
+#   Chosen: N = 2048, N_D = 512  ->  dx = 99.2 um, array 203.2 mm across (4 D),
+#   guard band 76.2 mm per side. Constraint 1 is met with 5.6x margin and
+#   constraint 2 with 24x.
+#
+# WHAT IS DELIBERATELY NOT RESOLVED. The edge ringing has a scale of about
+# a/(2 N_F) = 12.5 um, an eighth of a sample. Resolving it would need N_D ~
+# 12700 and a 32768^2 transform -- a memory benchmark, not a propagation one.
+# So this case measures every code on the same *band-limited* problem: the
+# angular spectrum of the sampled aperture, which is exactly what each library
+# computes when a user hands it this geometry. The gate compares against an
+# independent double-precision angular spectrum on the identical grid, so the
+# comparison is exact even though the continuous physics is under-resolved.
+# Do not read the result as a converged near-field diffraction pattern.
+
+id: asm_d50_z1m
+kind: plane_to_plane
+algorithm_class: angular_spectrum
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # "pupil" is the harness's name for the illumination plane; here it is simply
+  # the aperture. samples_across_diameter must be < array_samples so there is a
+  # guard band for the field to spread into.
+  diameter_m: 0.0508           # 25.4 mm radius
+  samples_across_diameter: 512
+  array_samples: 2048          # 4 D across, 76.2 mm of guard band per side
+  aperture: circular
+
+propagation:
+  distance_m: 1.0
+
+dtype: complex128
+basis_caching: precomputed
+
+execution:
+  warmup: 3
+  repeats: 25
+  timeout_s: 300.0
+
+accuracy:
+  # The analytic Airy reference is a focal-plane closed form and is meaningless
+  # here; the case loader rejects it for a free-space case. The reference is a
+  # direct double-precision angular spectrum on the same grid -- the definition
+  # written out, in reference.reference_angular_spectrum.
+  #
+  # 1e-10, and it is NOT a formality: the assumption that "every code does an
+  # FFT-based free-space propagation" turns out to hide three different kernels.
+  # Measured on this geometry:
+  #
+  #   exact ASM  exp(i k z sqrt(1 - (lam f)^2))      the reference
+  #   paraxial   exp(i k z) exp(-i pi lam z f^2)     differs from exact by 4.07e-6
+  #
+  #   numpy_baseline  0        against exact     -- exact ASM
+  #   prysm           4.07e-6  against exact,  1.8e-14 against paraxial
+  #                                               -- Wavefront.free_space is the
+  #                                                  Fresnel TF, not the sqrt form
+  #   hcipy           2.66e-5  against exact,  2.67e-5 against paraxial
+  #                                               -- neither; AngularSpectrumPropagator
+  #                                                  applies its own band limiting
+  #
+  # At N_F = 1020 those are not interchangeable propagators, and the gate says
+  # so rather than absorbing the difference into a loose tolerance. A code that
+  # fails here has not been caught doing something wrong -- it has been caught
+  # doing something *different*, which is the more useful finding and the reason
+  # the tolerance stays tight.
+  reference: internal_angular_spectrum
+  max_rel_l2: 1.0e-10
+
+notes: >
+  Free-space board. All six libraries expose a free-space propagator -- hcipy
+  (AngularSpectrumPropagator), prysm (Wavefront.free_space), PROPER
+  (prop_propagate), POPPY (FresnelWavefront), lentil (propagate_fft), dLux
+  (ASMPropagator) -- but they do not all compute the same one, which is the
+  first thing this case measured. Read the accuracy block before the timings:
+  a failing row here usually means a different kernel, not a broken adapter.

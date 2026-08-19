@@ -207,10 +207,69 @@ def cmd_report(args, repo: Path) -> int:
     return 0
 
 
+def cmd_plot(args, repo: Path) -> int:
+    from .plots import plot_scans
+    from .report import aggregate, scan_rows
+
+    rows = aggregate(repo / "results")
+    plottable = scan_rows(rows, case=args.case, config=args.config)
+    if not plottable:
+        have = sorted({r["case"] for r in rows if r.get("scan_value") is not None})
+        if args.case and args.case not in have:
+            print(f"no scan results for case {args.case!r}. "
+                  f"Scan cases in results/: {have or 'none'}")
+        elif have:
+            print(f"every scan point in {have} was excluded: a plotted point must have "
+                  f"status ok, a passing gate and traced=false. `dragrace report` lists "
+                  f"them with reasons.")
+        else:
+            print("no scan results found. Scan cases carry a `scan:` block; run one "
+                  "with e.g.\n  dragrace sweep --cases mft_array_scan --modes timing")
+        return 1
+
+    out = Path(args.out) if args.out else repo / "results" / "plots"
+    paths = plot_scans(rows, out, fmt=args.format, case=args.case,
+                       config=args.config, linear=args.linear)
+    for p in paths:
+        print(f"wrote {p}")
+    print(f"\n{len(plottable)} points -> {len(paths)} figure(s); one per machine "
+          f"fingerprint and measurement contract, never merged")
+    return 0
+
+
+def _print_scan(res: dict) -> None:
+    scan = res["scan"]
+    print(f"  scan {scan['parameter']}:")
+    print(f"    {'value':>7}{'median ms':>12}{'GFLOP':>10}{'GFLOP/s':>10}{'build ms':>10}"
+          f"{'rel_l2':>11}  status")
+    for p in scan["points"]:
+        stats = (p.get("timing") or {}).get("device_compute_stats") or {}
+        med = stats.get("median")
+        g = ((p.get("flops") or {}).get("ideal") or {}).get("flops", 0) / 1e9
+        acc = (p.get("accuracy") or {}).get("rel_l2")
+        build = (p.get("setup") or {}).get("build_s")
+        print(f"    {p['scan_value']:>7}"
+              f"{med * 1e3 if med else float('nan'):>12.3f}"
+              f"{g:>10.4f}"
+              f"{g / med if med else float('nan'):>10.2f}"
+              f"{build * 1e3 if build else float('nan'):>10.3f}"
+              f"{acc if acc is not None else float('nan'):>11.2e}"
+              f"  {p.get('status')}")
+        if p.get("status") not in ("ok", None):
+            print(f"            {str(p.get('reason', ''))[:90]}")
+    if any(p.get("status") == "ok" for p in scan["points"]):
+        print("  plot with: dragrace plot --case " + str(res.get("case_id")))
+
+
 def _print_result(res: dict) -> None:
     st = res.get("status")
     print(f"status={st}  {res.get('adapter', {}).get('name')} "
           f"{res.get('case_id')} [{res.get('config_id')}] {res.get('mode')}")
+    if res.get("scan", {}).get("points"):
+        _print_scan(res)
+        if st not in ("ok", "unsupported", "skipped"):
+            print(f"  reason:   {res.get('reason')}")
+        return
     if "accuracy" in res:
         a = res["accuracy"]
         print(f"  accuracy: rel_l2={a.get('rel_l2'):.3e} gate={a.get('gate')} "
@@ -273,11 +332,21 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("report", help="aggregate results")
 
+    p = sub.add_parser("plot", help="line plots of runtime vs array size for scan cases")
+    p.add_argument("--case", default=None, help="restrict to one scan case")
+    p.add_argument("--config", default=None, help="restrict to one config")
+    p.add_argument("--out", default=None, help="output directory (default results/plots)")
+    p.add_argument("--format", default="png", choices=["png", "pdf", "svg"])
+    p.add_argument("--linear", action="store_true",
+                   help="linear axes; log-log is the default because a power law is "
+                        "a straight line on it and the slope is the thing being read")
+
     args = ap.parse_args(argv)
     repo = Path(args.repo).resolve()
     return {
         "list": cmd_list, "doctor": cmd_doctor, "run": cmd_run, "sweep": cmd_sweep,
         "ledger": cmd_ledger, "machine": cmd_machine, "report": cmd_report,
+        "plot": cmd_plot,
     }[args.cmd](args, repo)
 
 

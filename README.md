@@ -7,6 +7,16 @@ Compares runtime, memory footprint and — the part that survives being run on
 someone else's machine — *algorithmic* efficiency: how much arithmetic each
 code actually performs relative to what the physics requires.
 
+**Each code is measured through the API its own documentation teaches** — POPPY's
+`OpticalSystem.calc_psf`, prysm's `Wavefront.focus_dft`, lentil's
+`propagate_dft`, dLux's `propagate_mono` — not through its internal transform.
+Building the optical system is untimed, because a user hoists it out of their
+loop; one PSF through the documented path is what the clock sees. That choice is
+not free: for POPPY it is 83% slower at N=1024 than calling `poppy.matrixDFT`
+directly, and that difference is real time a user waits for. Results carry a
+`measurement_contract` field so this can never be silently redefined
+([docs/methodology.md](docs/methodology.md)).
+
 A benchmark run is the triple **(case × config × adapter)**:
 
 | | what it fixes | where |
@@ -32,12 +42,13 @@ pip install -e .                           # the harness itself
 `envs/` — see [envs/README.md](envs/README.md) for why a single environment
 cannot cover the backend axis.
 
-Check what you got:
+Check what you got with the `dragrace doctor` bash command:
 
 ```bash
 dragrace doctor
 ```
 
+This will print your recognized machine specifications
 ```
 machine   AMD Ryzen 9 7900X 12-Core Processor  (amd, 24 logical cores)
 gpu       none detected -- gpu_* configs will be skipped
@@ -45,6 +56,10 @@ blas      openblas
           openblas   threads=1    /.../libscipy_openblas.so
 fft       importable: {'mkl': True, 'pyfftw': False, 'scipy_pocketfft': True, 'numpy': True}
 ```
+
+As well as the support matrix for various attributes of the drag race
+
+
 
 ---
 
@@ -129,6 +144,93 @@ reason**, never silently executed in whatever interpreter happens to be active:
      environment.yml / envs/, then `pip install -e .` ...
 ```
 
+### An array-size scan
+
+A single N is the least trustworthy way to rank these codes: at small N they are
+separated by Python dispatch and at large N by BLAS, and the lines cross. The
+`mft_array_scan` case measures the same physics at five pupil array sizes —
+**all in one worker process, written to one `result.json`** — so the curve's
+shape is a property of the code rather than of what else the machine was doing
+between two invocations.
+
+```bash
+dragrace sweep --cases mft_array_scan --adapters numpy_baseline prysm lentil poppy
+dragrace report                       # scan table, adapter x size
+dragrace plot                         # runtime vs array size, one line per adapter
+```
+
+```
+SCAN mft_array_scan [cpu_numpy_1t] [idiomatic-v1]  n_pupil, median ms
+adapter                 128        256        512       1024       2048
+-----------------------------------------------------------------------
+dlux                  0.840      1.762      5.099     17.871     60.591
+hcipy                 0.914      2.644      8.820     31.563    119.203
+lentil                1.638      4.844     17.091     61.189    231.191
+numpy_baseline        0.886      2.615      8.830     32.007    122.138
+poppy                 3.170      6.685     18.890     62.541    236.179
+prysm                 0.893      2.670      9.161     31.806    119.640
+ideal GFLOP           0.034      0.101      0.336      1.208      4.563
+
+BACKEND AXES THAT DID NOT APPLY
+  dlux            cpu_numpy_1t    blas, fft, threads
+```
+
+dLux is on that board even though it runs on XLA rather than the config's NumPy:
+XLA is not an alternative backend for dLux, it is the only one, and leaving the
+fastest code in the suite off the chart would say less than including it with
+the caveat attached. Every dLux result records which config axes did not apply,
+`dragrace report` prints them, and the figure caption carries them — a dLux row
+is a valid measurement of dLux and **not** a data point in a backend comparison.
+
+The number being read is the *slope*. The ideal row grows 4× per doubling
+(quadratic in N_p for an MFT at fixed focal grid), so a code tracking it is
+spending its time on the physics; a code steeper than it is doing work the
+physics does not require. A code *flatter* than it at small N is dispatch-bound,
+not fast — poppy above runs at 10 GFLOP/s at N=128 and 19 GFLOP/s at N=2048,
+which is the same code paying a fixed per-call overhead that stops mattering
+once the arithmetic grows.
+
+Read against the primitive board, this table is also a measurement of what the
+user-facing API costs. prysm's `Wavefront` wrapper is free (124 ms against 119
+for the raw transform at N=2048); POPPY and lentil roughly double, because
+`calc_psf` and `Wavefront(λ) * pupil` rebuild the wavefront and re-apply every
+optic on each call. That is an attribution, not a verdict — see
+[docs/methodology.md](docs/methodology.md).
+
+`dragrace plot` draws that on log-log axes with the ideal scaling as a reference
+slope, one figure per machine fingerprint, and names any point it had to exclude.
+Every point is gated independently, so a code that drifts at large N leaves a
+visible hole rather than a timing row that means something different from its
+neighbours. Scans of the focal grid instead of the pupil use
+`scan: {parameter: n_focus}`; matplotlib is optional (`pip install -e ".[report]"`)
+and the scan table above needs none of it.
+
+### The XLA board
+
+To take the backend axis out of the comparison instead of caveating it,
+`cpu_xla_1t` runs every adapter that can go through XLA on the same kernels:
+
+```bash
+dragrace sweep --cases mft_array_scan --configs cpu_xla_1t --adapters prysm dlux
+```
+
+```
+SCAN mft_array_scan [cpu_xla_1t] [idiomatic-v1]  n_pupil, median ms
+adapter                 128        256        512       1024       2048
+-----------------------------------------------------------------------
+dlux                  0.785      2.032      5.165     17.974     59.378
+prysm                 0.289      1.119      3.271      9.253     30.662
+```
+
+dLux is native there; prysm gets there because `prysm.mathops` is a backend shim
+and pointing its array module at `jax.numpy` works unmodified (rel_l2 = 1.3e-15).
+HCIPy, POPPY, lentil and PROPER have no XLA path and report `unsupported` rather
+than run on NumPy under an XLA label.
+
+The same prysm code path is ~3.4× faster on XLA than on OpenBLAS at N=1024
+(9.3 ms against 31.8). Compare the two configs to separate "what the library
+asks for" from "what the backend does with it" — but never plot them on one axis.
+
 ### Roofline peaks
 
 ```bash
@@ -141,7 +243,10 @@ dragrace machine          # measured zgemm peak + STREAM triad, not spec-sheet n
 
 Every run writes `results/raw/<machine>/<run_id>/<adapter>/<config>/<case>/<mode>/result.json`
 containing the timing distribution (not just a mean), the accuracy comparison,
-the resolved backend, the machine fingerprint, and the setup-cost breakdown.
+the resolved backend, the machine fingerprint, and the setup-cost breakdown. A
+scan case writes every array size into that one file, under a `scan` block whose
+points each carry their own timing and gate — field by field in
+[docs/parsing_results.md](docs/parsing_results.md).
 
 Two guard rails are enforced rather than left to discipline:
 
@@ -224,6 +329,7 @@ hand-written-adjoint confound on the gradient board is real and documented.
 - [docs/flop_model.md](docs/flop_model.md) — the cost model, with derivations
 - [docs/gradient_board.md](docs/gradient_board.md) — prysm vs dLux in detail
 - [docs/adding_an_adapter.md](docs/adding_an_adapter.md) — the contract
+- [docs/parsing_results.md](docs/parsing_results.md) — every field of `result.json`, and how to read it safely
 - [envs/README.md](envs/README.md) — the environment matrix and its caveats
 
 ## Tests

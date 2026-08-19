@@ -1,0 +1,42 @@
+# XLA on CPU, single-threaded.
+#
+# The point of this config is to take the backend axis away from the comparison.
+# On cpu_numpy_1t, dLux is the odd one out: it has no FFT library to select and
+# no BLAS to point at, so its row is legitimate but is not a data point in a
+# backend comparison (the adapter declares `config_axes_not_selectable`, and
+# every dLux result says so in backend.warnings). Here every adapter that can
+# run is running on the *same* XLA kernels, so a difference between them is a
+# difference in what the library asks XLA to do.
+#
+# Who can run here:
+#
+#   dlux    natively -- JAX is what dLux is.
+#   prysm   yes: prysm.mathops is a backend shim, and pointing its array module
+#           at jax.numpy works unmodified (verified, rel_l2 = 1.3e-15).
+#   others  no. HCIPy's _math layer offers numpy/scipy/mkl/fftw only, POPPY's
+#           accel_math offers numpy/cupy/numexpr, lentil is numpy-only, and
+#           PROPER is Fortran-derived numpy. They report `unsupported` with that
+#           reason rather than silently running on NumPy under an XLA label.
+#
+# THREADS. OMP_NUM_THREADS does not reach XLA, which runs its own Eigen thread
+# pool sized to the core count. Config.jax_env() emits the XLA_FLAGS that make
+# threads=1 true here, before the first jax import -- without it a run labelled
+# 1 thread could quietly use every core.
+#
+# NOT A GPU CONFIG. XLA on CPU is a genuinely different execution engine from
+# XLA on GPU; gpu_f64 covers the latter and the two must not be read as one axis.
+
+id: cpu_xla_1t
+device: cpu
+fft_backend: xla          # 'XLA supplies its own'; verify() treats it as such
+blas_backend: unknown     # XLA emits its own kernels; there is no BLAS to name
+threads: 1
+precision_override: null
+
+conda_env: dragrace
+
+notes: >
+  Same-engine comparison: every adapter here executes through XLA, so the
+  remaining differences are the libraries' own. Compare against cpu_numpy_1t to
+  separate "what the library asks for" from "what the backend does with it" --
+  but never plot the two configs on one axis.

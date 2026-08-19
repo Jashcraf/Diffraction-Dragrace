@@ -66,8 +66,11 @@ class NumpyBaselineAdapter(Adapter):
         return {"numpy": np.__version__, "adapter": "0.1.0"}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
-        if case.algorithm_class not in ("matrix_dft", "fft"):
-            return Unsupported(f"baseline implements matrix_dft and fft, not {case.algorithm_class}")
+        if case.algorithm_class not in ("matrix_dft", "fft", "angular_spectrum",
+                                        "fresnel_tf"):
+            return Unsupported(
+                f"baseline implements matrix_dft, fft, angular_spectrum and "
+                f"fresnel_tf, not {case.algorithm_class}")
         if config.is_gpu:
             return Unsupported("CPU only by construction; this is the NumPy floor")
         return True
@@ -96,6 +99,21 @@ class NumpyBaselineAdapter(Adapter):
         field = pupil_field(case)
         state = {"case": case, "field": field, "cls": case.algorithm_class}
 
+        if case.algorithm_class in ("angular_spectrum", "fresnel_tf"):
+            # Whichever kernel the case names -- exact or paraxial. The transfer
+            # function is hoisted: it depends only on the geometry, so a user
+            # propagating repeatedly builds it once. Whether a library does that
+            # is exactly the kind of design difference the ledger and the
+            # setup/steady split exist to expose.
+            from dragrace.reference import free_space_transfer_function
+            state["cls"] = "free_space"
+            state["H"] = free_space_transfer_function(
+                case, case.algorithm_class).astype(case.dtype)
+            # Stored unshifted so propagate() is a plain fft2/ifft2 pair; the
+            # shift is a build-time cost, not a per-call one.
+            state["field"] = np.fft.ifftshift(field)
+            return state
+
         if case.algorithm_class == "matrix_dft":
             x = pupil_coords(case)
             u = focus_coords(case)
@@ -113,6 +131,10 @@ class NumpyBaselineAdapter(Adapter):
 
     def propagate(self, state):
         case = state["case"]
+        if state["cls"] == "free_space":
+            out = np.fft.ifft2(np.fft.fft2(state["field"]) * state["H"])
+            return np.fft.fftshift(out)
+
         if state["cls"] == "matrix_dft":
             kx = state["kx"]
             return (kx @ state["field"]) @ kx.T * state["scale"]

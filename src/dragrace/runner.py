@@ -114,8 +114,10 @@ def run_one(spec: RunSpec, results_root: Path, run_id: str, machine_id: str,
         (out / "result.json").write_text(json.dumps(res, indent=2))
         return res
 
+    # timeout_s is per measurement, so a scan case gets it once per point --
+    # otherwise adding sizes to a scan would silently start killing it.
     proc = subprocess.run(cmd, cwd=repo_root, env=env, capture_output=True, text=True,
-                          timeout=spec.case.execution.timeout_s + 120)
+                          timeout=spec.case.total_timeout_s + 120)
     rpath = out / "result.json"
     if rpath.exists():
         res = json.loads(rpath.read_text())

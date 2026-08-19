@@ -26,12 +26,17 @@ from .case import Case
 class Comparison:
     rel_l2: float            # shape error after fitting scale; the gated number
     scale_abs: float         # |alpha|: normalisation relative to the reference
-    scale_phase_rad: float   # arg(alpha): global piston, physically irrelevant
-    conjugated: bool         # whether the test field matched the conjugate
+    scale_phase_rad: float | None   # arg(alpha): global piston, physically
+                             # irrelevant. None when only intensity was compared.
+    conjugated: bool | None  # whether the test field matched the conjugate.
+                             # None when only intensity was compared -- squaring
+                             # the modulus destroys the sign of the phase, so the
+                             # question has no answer rather than a False answer.
     peak_ratio: float
     peak_offset_px: tuple[int, int]
     gate: str                # pass | fail
     reference: str
+    quantity: str = "field"  # field | intensity -- what was actually gated
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -83,6 +88,56 @@ def compare(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparison:
     )
 
 
+def compare_intensity(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparison:
+    """Gate |E|^2 rather than E, for codes whose documented output is a PSF.
+
+    PROPER's `prop_end` returns intensity unless asked for the field, and its
+    focal amplitude matches the reference to ~1e-7 while its *phase* carries a
+    residual quadratic curvature -- it propagates through a lens and tracks a
+    reference sphere rather than assuming the Fraunhofer limit. A single complex
+    scale cannot absorb a quadratic, so gating the field would reject a PSF that
+    is correct to a part in ten million.
+
+    What is given up is stated rather than hidden: squaring the modulus destroys
+    the phase, so `conjugated` and `scale_phase_rad` come back None and an
+    intensity-gated row must not be used for any phase-sensitive claim. That is
+    why this is a per-adapter declaration and not a fallback the harness reaches
+    for when the field comparison fails.
+    """
+    test = np.asarray(test)
+    ref = np.asarray(ref)
+    if test.shape != ref.shape:
+        raise ValueError(
+            f"shape mismatch: adapter returned {test.shape}, reference is {ref.shape}. "
+            f"Case {case.id!r} specifies N_f={case.n_focus} on the canonical focal grid."
+        )
+
+    t = np.abs(test.astype(np.complex128)) ** 2
+    r = np.abs(ref) ** 2
+    denom = float((r * r).sum())
+    a = float((t * r).sum() / denom) if denom else float("inf")
+    scale = np.linalg.norm(a * r)
+    rel = float(np.linalg.norm(t - a * r) / scale) if scale else float("inf")
+
+    ti = np.unravel_index(int(np.argmax(t)), t.shape)
+    ri = np.unravel_index(int(np.argmax(r)), r.shape)
+    peak_ratio = float(t[ti] / r[ri]) if r[ri] > 0 else float("inf")
+
+    return Comparison(
+        rel_l2=rel,
+        # sqrt so the number means the same thing as the field path's scale_abs:
+        # the amplitude ratio, not the intensity ratio.
+        scale_abs=float(np.sqrt(a)) if a == a and a >= 0 else float("inf"),
+        scale_phase_rad=None,
+        conjugated=None,
+        peak_ratio=peak_ratio,
+        peak_offset_px=(int(ti[0] - ri[0]), int(ti[1] - ri[1])),
+        gate="pass" if rel <= case.accuracy.max_rel_l2 else "fail",
+        reference=case.accuracy.reference,
+        quantity="intensity",
+    )
+
+
 def gate_message(c: Comparison, case: Case) -> str:
     if c.gate == "pass":
         return f"accuracy pass: rel_l2={c.rel_l2:.3e} <= {case.accuracy.max_rel_l2:.1e}"
@@ -91,7 +146,8 @@ def gate_message(c: Comparison, case: Case) -> str:
         extra = (f"  PSF peak is offset by {c.peak_offset_px} px -- likely a grid-centring "
                  f"convention mismatch rather than a propagation error.")
     return (f"accuracy FAIL: rel_l2={c.rel_l2:.3e} > {case.accuracy.max_rel_l2:.1e} "
-            f"(scale={c.scale_abs:.6g}, conjugated={c.conjugated}).{extra}")
+            f"on {c.quantity} (scale={c.scale_abs:.6g}, "
+            f"conjugated={c.conjugated}).{extra}")
 
 
 # --------------------------------------------------------- gradient board ---

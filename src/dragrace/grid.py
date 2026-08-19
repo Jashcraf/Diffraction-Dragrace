@@ -1,21 +1,46 @@
 """Canonical grids, apertures and bases.
 
-Every adapter is handed the *identical* pupil array built here, rather than
-building its own. This is deliberate: aperture antialiasing, grid centring and
-Zernike normalisation all differ between these six codes, and those differences
-would otherwise show up as accuracy failures or -- worse -- as timing
-differences, because an antialiased aperture costs more to render than a hard
-mask. Removing them from the measurement is what makes the propagation itself
-the thing being compared.
+Every adapter is handed a pupil array built here, rather than building its own.
+This is deliberate: aperture antialiasing and Zernike normalisation differ
+between these six codes, and those differences would otherwise show up as
+accuracy failures or -- worse -- as timing differences, because an antialiased
+aperture costs more to render than a hard mask. Removing them from the
+measurement is what makes the propagation itself the thing being compared.
+
+The one thing that is *not* pinned is where the samples sit; see CENTRING below.
+Two adapters on different centring conventions get the same aperture rule,
+evaluated on grids offset by half a sample -- identical cost, identical physics,
+different sample positions.
 
 Conventions (see docs/conventions.md):
 
   * Lengths in the pupil are in units of the pupil diameter D, so the aperture
     has radius 0.5 and sample spacing dx = 1/N_D.
   * Focal-plane coordinates are in units of lambda*F/D, with spacing 1/q.
-  * Both grids are centred at index N//2 -- the fftshift convention. For even
-    N this leaves the grid asymmetric by one sample, which is standard, and is
-    consistent between the MFT and FFT paths so the two agree to roundoff.
+  * Grids are centred by the case's *centring convention*, `pixel` by default.
+
+CENTRING. Two conventions are in circulation and both are correct
+discretisations of the same continuous problem:
+
+  pixel        x[i] = (i - N//2) * dx        the fftshift convention: the origin
+                                             lands ON a sample, so an on-axis
+                                             PSF peaks in a single pixel.
+  interpixel   x[i] = (i - N/2 + 0.5) * dx   the origin lands BETWEEN the middle
+                                             samples, so an on-axis PSF is
+                                             centred on the four-pixel cross.
+
+Which one a code produces is not a free choice for the benchmark to make.
+POPPY's OpticalSystem hard-codes interpixel centring inside `_propagate_mft`,
+and no documented knob reaches it; measuring POPPY through the API its own
+documentation teaches therefore means measuring it on an interpixel grid.
+
+So the *adapter* declares which convention its output obeys, and the reference,
+the injected pupil and the coordinates are all built to match. Every adapter
+still receives the identical aperture rule, identical physics and an identically
+priced rasterisation -- what differs is only where the samples sit, which is the
+one thing a library is entitled to decide. Comparing a code against a reference
+on a foreign grid measures the convention mismatch and nothing else: POPPY scores
+rel_l2 = 0.28 against a pixel-centred reference and 1.5e-15 against its own.
 """
 from __future__ import annotations
 
@@ -25,28 +50,70 @@ import numpy as np
 
 from .case import Case
 
+CENTERINGS = {"pixel", "interpixel"}
+
+
+def centre_offset(centering: str) -> float:
+    """Sample offset applied to every grid built under this convention."""
+    if centering not in CENTERINGS:
+        raise ValueError(f"unknown centering {centering!r}; expected one of {sorted(CENTERINGS)}")
+    return 0.5 if centering == "interpixel" else 0.0
+
+
+def centering_pair(spec) -> tuple[str, str]:
+    """(pupil, focus) from an adapter's declaration.
+
+    A plain string means both planes share a convention, which is the usual
+    case. A mapping declares them separately, which is not a hypothetical:
+    HCIPy's `make_pupil_grid` is interpixel while its `make_focal_grid` puts a
+    sample on the axis, so the two planes genuinely disagree inside one library.
+    Forcing a single answer there costs 5.9e-3 of accuracy -- small enough to
+    look like a tolerance problem and be "fixed" by loosening the gate, which is
+    exactly the mistake this pair exists to prevent.
+    """
+    if isinstance(spec, str):
+        pupil = focus = spec
+    else:
+        try:
+            pupil, focus = spec["pupil"], spec["focus"]
+        except (TypeError, KeyError) as exc:
+            raise ValueError(
+                f"grid_centering must be a string or a mapping with 'pupil' and "
+                f"'focus' keys, got {spec!r}"
+            ) from exc
+    centre_offset(pupil)
+    centre_offset(focus)
+    return pupil, focus
+
+
+def _axis(n: int, spacing: float, centering: str) -> np.ndarray:
+    # n//2 and n/2 differ for odd n; the pixel branch keeps the integer form so
+    # that odd-N grids stay symmetric about their centre sample.
+    if centering == "interpixel":
+        return (np.arange(n, dtype=np.float64) - n / 2.0 + 0.5) * spacing
+    centre_offset(centering)                       # validate
+    return (np.arange(n, dtype=np.float64) - n // 2) * spacing
+
 
 # ------------------------------------------------------------- coordinates --
-def pupil_coords(case: Case) -> np.ndarray:
-    """1-D pupil coordinate in units of D."""
-    n = case.n_pupil
-    return (np.arange(n, dtype=np.float64) - n // 2) * case.dx_pupil
+def pupil_coords(case: Case, centering="pixel") -> np.ndarray:
+    """1-D pupil coordinate in units of D. Uses the pupil half of `centering`."""
+    return _axis(case.n_pupil, case.dx_pupil, centering_pair(centering)[0])
 
 
-def focus_coords(case: Case) -> np.ndarray:
-    """1-D focal coordinate in units of lambda*F/D."""
-    n = case.n_focus
-    return (np.arange(n, dtype=np.float64) - n // 2) * case.du_focus
+def focus_coords(case: Case, centering="pixel") -> np.ndarray:
+    """1-D focal coordinate in lambda*F/D. Uses the focal half of `centering`."""
+    return _axis(case.n_focus, case.du_focus, centering_pair(centering)[1])
 
 
-def pupil_rho_theta(case: Case) -> tuple[np.ndarray, np.ndarray]:
-    x = pupil_coords(case)
+def pupil_rho_theta(case: Case, centering="pixel") -> tuple[np.ndarray, np.ndarray]:
+    x = pupil_coords(case, centering)
     xx, yy = np.meshgrid(x, x, indexing="xy")
     return np.hypot(xx, yy), np.arctan2(yy, xx)
 
 
 # ---------------------------------------------------------------- aperture --
-def circular_aperture(case: Case) -> np.ndarray:
+def circular_aperture(case: Case, centering="pixel") -> np.ndarray:
     """Hard-edged unit-transmission circular aperture, radius 0.5 (= D/2).
 
     Deliberately not antialiased. An antialiased edge is a better optical model
@@ -55,7 +122,7 @@ def circular_aperture(case: Case) -> np.ndarray:
     rasterisation. Cases needing a grey edge should add an explicit
     `aperture: circular_antialiased` rather than letting adapters differ.
     """
-    rho, _ = pupil_rho_theta(case)
+    rho, _ = pupil_rho_theta(case, centering)
     return (rho <= 0.5).astype(np.float64)
 
 
@@ -86,7 +153,7 @@ def _zernike_radial(n: int, m: int, rho: np.ndarray) -> np.ndarray:
     return out
 
 
-def zernike_basis(case: Case, noll_indices: list[int]) -> np.ndarray:
+def zernike_basis(case: Case, noll_indices: list[int], centering="pixel") -> np.ndarray:
     """(P, N_p, N_p) Zernike basis, numerically normalised to unit RMS over the
     aperture and zero outside it.
 
@@ -95,8 +162,8 @@ def zernike_basis(case: Case, noll_indices: list[int]) -> np.ndarray:
     numerically makes "waves RMS" mean exactly that, so a coefficient is
     comparable across grid sizes -- which matters because N is a swept axis.
     """
-    rho, theta = pupil_rho_theta(case)
-    mask = circular_aperture(case) > 0
+    rho, theta = pupil_rho_theta(case, centering)
+    mask = circular_aperture(case, centering) > 0
     rho_unit = rho / 0.5                       # radius 0.5 -> unit disk
 
     modes = np.zeros((len(noll_indices), case.n_pupil, case.n_pupil), dtype=np.float64)
@@ -119,33 +186,33 @@ def zernike_basis(case: Case, noll_indices: list[int]) -> np.ndarray:
     return modes
 
 
-def opd_waves(case: Case) -> np.ndarray:
+def opd_waves(case: Case, centering="pixel") -> np.ndarray:
     """Static aberration OPD in waves, from the case's Zernike coefficients."""
     ab = case.pupil.aberration
     if not ab.coefficients:
         return np.zeros((case.n_pupil, case.n_pupil), dtype=np.float64)
     if ab.convention != "noll_rms_waves":
         raise ValueError(f"unsupported aberration convention {ab.convention!r}")
-    basis = zernike_basis(case, ab.noll_indices)
+    basis = zernike_basis(case, ab.noll_indices, centering)
     return np.tensordot(np.asarray(ab.values), basis, axes=(0, 0))
 
 
 # ------------------------------------------------------------- pupil field --
-def pupil_field(case: Case, opd: np.ndarray | None = None) -> np.ndarray:
+def pupil_field(case: Case, opd: np.ndarray | None = None, centering="pixel") -> np.ndarray:
     """Complex pupil field: amplitude mask times phasor, in the case dtype.
 
     OPD is carried in waves so the phasor is exp(2j*pi*opd) with no wavelength
     factor -- this keeps the harness free of the metres-vs-microns unit slips
     that are otherwise a recurring source of cross-code disagreement.
     """
-    amp = circular_aperture(case)
+    amp = circular_aperture(case, centering)
     if opd is None:
-        opd = opd_waves(case)
+        opd = opd_waves(case, centering)
     field = amp * np.exp(2j * np.pi * opd)
     return field.astype(case.dtype)
 
 
-def gradient_parameters(case: Case) -> tuple[list[int], np.ndarray, np.ndarray]:
+def gradient_parameters(case: Case, centering="pixel") -> tuple[list[int], np.ndarray, np.ndarray]:
     """(noll_indices, theta0, basis) for a gradient case.
 
     theta0 is drawn from a seeded RNG so every adapter differentiates at the
@@ -160,4 +227,4 @@ def gradient_parameters(case: Case) -> tuple[list[int], np.ndarray, np.ndarray]:
     noll = list(range(p.first_noll, p.first_noll + p.count))
     rng = np.random.default_rng(p.seed)
     theta0 = rng.normal(0.0, p.amplitude_waves_rms, size=p.count)
-    return noll, theta0, zernike_basis(case, noll)
+    return noll, theta0, zernike_basis(case, noll, centering)
