@@ -74,6 +74,28 @@ class DLuxAdapter(Adapter):
     #: in as evidence.
     config_axes_not_selectable = ("fft", "blas", "threads")   # refined in configure()
 
+    #: Measured peak-memory model for the aperture board, and it had to be
+    #: measured. The obvious estimate -- one float64 per segment per pixel,
+    #: n_segments x N^2 x 8 -- understates the real peak by more than an order of
+    #: magnitude, because XLA does not simply stack and reduce: soft_reg_polygon
+    #: evaluates a signed distance against all six edges of every hexagon, and
+    #: the fused kernel holds far more live than the result. Trusting the naive
+    #: figure is what let a 16 GiB budget admit N=1024, whose true peak is near
+    #: 70 GiB; the worker was OOM-killed before writing anything.
+    #:
+    #:   N=256   6.62 GiB measured   (naive 0.39, 17.0x)
+    #:   N=512  19.18 GiB measured   (naive 1.56, 12.3x)
+    #:
+    #: Fitting peak = FIXED + SLOPE * n_segments * N^2 * 8 through those two
+    #: points, with the slope taken at the lower (less flattering) ratio:
+    APERTURE_FIXED_BYTES = int(2.4 * 2**30)     # tracing/compiling 798 apertures
+    APERTURE_STACK_MULTIPLIER = 12.0            # live buffers per naive stack byte
+
+    @classmethod
+    def _aperture_peak_bytes(cls, case: Case) -> float:
+        naive = float(case.segmented.n_segments) * case.n_pupil * case.n_pupil * 8.0
+        return cls.APERTURE_FIXED_BYTES + cls.APERTURE_STACK_MULTIPLIER * naive
+
     def versions(self) -> dict[str, str]:
         import jax
         out = {"jax": jax.__version__, "numpy": np.__version__}
@@ -85,6 +107,23 @@ class DLuxAdapter(Adapter):
         return out
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_aperture:
+            from dragrace.apertures import APERTURE_MEMORY_BUDGET_BYTES
+            need = self._aperture_peak_bytes(case)
+            if need > APERTURE_MEMORY_BUDGET_BYTES:
+                return Unsupported(
+                    f"dLux evaluates each of the {case.segmented.n_segments} "
+                    f"sub-apertures over the whole coordinate grid and stacks them "
+                    f"before reducing (CompositeAperture.transmission), so the "
+                    f"intermediate is n_segments x N^2 x 8 bytes = "
+                    f"{need / 2**30:.1f} GiB at N={case.n_pupil} (measured model, "
+                    f"not the naive stack figure -- that understates it 12-17x), "
+                    f"against a {APERTURE_MEMORY_BUDGET_BYTES / 2**30:.0f} GiB budget. "
+                    f"Its apertures are dynamically generated so they stay "
+                    f"differentiable -- the right trade for the gradient board and "
+                    f"the wrong one for drawing a pupil once."
+                )
+            return True
         if case.algorithm_class == "angular_spectrum":
             return Unsupported(
                 "dLux's ASMPropagator applies the PARAXIAL Fresnel transfer function "
@@ -193,8 +232,80 @@ class DLuxAdapter(Adapter):
                                        spec=dLux.CoordSpec(case.n_pupil, None, None))],
         )
 
+    def _build_aperture(self, case: Case, config: Config):
+        """MultiAperture of RegPolyAperture segments, times a Spider.
+
+        dLux has no ELT and no segmented-aperture helper, so the pupil is
+        composed from its aperture layers the way its documentation teaches:
+        MultiAperture combines sub-apertures additively (the "mask with multiple
+        holes" case), CompoundAperture combines multiplicatively, so the segments
+        go in the former and the spider multiplies the result.
+
+        Segment centres come straight from the canonical layout rather than from
+        a lattice dLux enumerates, because dLux has no segment index to match
+        against -- each sub-aperture is placed by an explicit CoordTransform. So
+        unlike the other adapters there is nothing here to reconcile, and the
+        selection is exact by construction.
+
+        Rotation is 0, not 30 degrees: dLux's soft_reg_polygon already puts the
+        hexagon flats where the ELT wants them. Measured both ways -- IoU 0.965
+        at rotation 0 against 0.905 at 30.
+
+        Two consequences of dLux's design show up in the output and are left
+        alone rather than papered over. The transmission is not bounded by 1
+        (measured max 1.42): MultiAperture *adds*, and the ELT's gaps are
+        sub-pixel at every size on this scan, so adjacent soft edges overlap and
+        sum. And every aperture is soft-edged by construction, because that is
+        what keeps them differentiable. The geometry gate binarises, so neither
+        changes the verdict, and accuracy.edge_relative_l2 records the softness.
+        """
+        import numpy as np
+        import jax
+        import dLux
+        import dLux.utils as dlu
+        from dragrace.apertures import elt_segment_centres
+
+        seg = case.segmented
+        centres = elt_segment_centres(case.segmented_spec())
+        rmax = seg.segment_vertex_to_vertex_m / 2.0        # centre-to-vertex
+
+        segments = dLux.MultiAperture([
+            dLux.RegPolyAperture(
+                6, rmax,
+                transformation=dLux.CoordTransform(
+                    translation=(float(x), float(y)), rotation=0.0))
+            for x, y in centres
+        ])
+        layers = [segments]
+        if seg.spider_count:
+            # +90 rather than the case's own +30: dLux.Spider documents its
+            # angles in degrees, but measures each arm from the +y axis while
+            # the case (and every other adapter here) measures from +x. Passing
+            # the case's angles unchanged puts the vanes 30 degrees off, which
+            # removes almost exactly the right *amount* of light in almost
+            # exactly the wrong *places* -- the fill fraction still lands within
+            # 0.3% of the reference, so nothing looks wrong until the geometry
+            # gate reports IoU 0.929. Measured across the offsets: only +30 on
+            # top of the case's 30 registers dLux's vanes onto the reference's.
+            layers.append(dLux.Spider(
+                seg.spider_width_m,
+                np.array([seg.spider_angle_offset_deg + 90.0 + 60.0 * i
+                          for i in range(seg.spider_count)])))
+        pupil = dLux.CompoundAperture(layers) if len(layers) > 1 else segments
+
+        coords = dlu.pixel_coords(case.n_pupil, case.pupil.diameter_m)
+        pixel_scale = case.pupil.diameter_m / case.n_pupil
+        # AOT-compiled for the same reason as the propagation boards: compile
+        # time becomes setup.first_call_s instead of hiding inside a warm-up.
+        compiled = jax.jit(
+            lambda: pupil.transmission(coords, pixel_scale)).lower().compile()
+        return {"case": case, "aperture": True, "fn": compiled}
+
     def build(self, case: Case, config: Config):
         import jax
+
+        if case.is_aperture:
+            return self._build_aperture(case, config)
 
         if case.kind == "plane_to_plane":
             self.grid_centering = "pixel"
@@ -227,16 +338,23 @@ class DLuxAdapter(Adapter):
 
     def propagate(self, state):
         """propagate_mono returns the PSF (intensity), as dLux documents."""
+        if state.get("aperture"):
+            return state["fn"]()
         return state["fn"](state["wavelength"])
 
     def complex_field(self, state, result) -> np.ndarray:
         """Untimed: dLux's documented `return_wf=True` hands back the Wavefront.
+
+        An aperture case has already produced the gated quantity -- a drawn
+        transmission mask -- so there is no field to recover.
 
         Same propagation, but it returns the object rather than the intensity,
         so it is kept out of the clock exactly as POPPY's return_final is.
         """
         import jax.numpy as jnp
 
+        if state.get("aperture"):
+            return self.to_host(result)
         wf = state["optics"].propagate_mono(state["wavelength"], return_wf=True)
         phasor = getattr(wf, "phasor", None)
         if phasor is None:

@@ -15,8 +15,9 @@ from typing import Any
 
 import yaml
 
-ALGORITHM_CLASSES = {"fft", "matrix_dft", "fresnel_tf", "fresnel_ir", "angular_spectrum", "czt"}
-KINDS = {"pupil_to_focus", "plane_to_plane", "gradient"}
+ALGORITHM_CLASSES = {"fft", "matrix_dft", "fresnel_tf", "fresnel_ir", "angular_spectrum", "czt",
+                     "segmented_aperture"}
+KINDS = {"pupil_to_focus", "plane_to_plane", "gradient", "aperture"}
 #: Algorithm classes that propagate between two parallel planes a
 #: distance apart, rather than pupil -> focus through a lens.
 FREE_SPACE_CLASSES = {"fresnel_tf", "fresnel_ir", "angular_spectrum"}
@@ -76,6 +77,52 @@ class Propagation:
     """
 
     distance_m: float
+
+
+@dataclass(frozen=True)
+class Segmented:
+    """A segmented pupil to be *drawn*, for kind=aperture.
+
+    Every other case hands the adapters a mask the harness rasterised; here the
+    rasterisation is the measurement, so the case carries a specification
+    instead. Defaults are the E-ELT Construction Proposal values -- see
+    dragrace.apertures, which owns the layout and the trap in it (the segment
+    size is vertex-to-vertex, not flat-to-flat).
+    """
+
+    layout: str = "elt"
+    rings: int = 17
+    segment_vertex_to_vertex_m: float = 1.45
+    segment_gap_m: float = 0.004
+    central_obscuration_flat_to_flat_m: float = 9.4136
+    spider_count: int = 6
+    spider_width_m: float = 0.4
+    spider_angle_offset_deg: float = 30.0
+    n_segments: int = 798
+
+    @property
+    def segment_flat_to_flat_m(self) -> float:
+        """Centre-to-centre spacing is this plus the gap, NOT vertex-to-vertex
+        plus the gap. Reading it the other way builds a pupil 15% too large."""
+        return self.segment_vertex_to_vertex_m * math.sqrt(3.0) / 2.0
+
+    @property
+    def segment_spacing_m(self) -> float:
+        return self.segment_flat_to_flat_m + self.segment_gap_m
+
+    def to_spec(self) -> dict:
+        """The dict dragrace.apertures speaks."""
+        return {
+            "outer_diameter_m": None,          # filled by Case.segmented_spec
+            "segment_vertex_to_vertex_m": self.segment_vertex_to_vertex_m,
+            "segment_gap_m": self.segment_gap_m,
+            "central_obscuration_flat_to_flat_m": self.central_obscuration_flat_to_flat_m,
+            "spider_count": self.spider_count,
+            "spider_width_m": self.spider_width_m,
+            "spider_angle_offset_deg": self.spider_angle_offset_deg,
+            "rings": self.rings,
+            "n_segments": self.n_segments,
+        }
 
 
 @dataclass(frozen=True)
@@ -139,6 +186,7 @@ class Case:
     execution: Execution = field(default_factory=Execution)
     accuracy: Accuracy = field(default_factory=Accuracy)
     parameters: Parameters | None = None
+    segmented: Segmented | None = None
     scan: Scan | None = None
     loss: str = "psf_mse"
     basis_caching: str = "precomputed"   # precomputed | per_call
@@ -158,13 +206,27 @@ class Case:
         return self.kind == "plane_to_plane"
 
     @property
+    def is_aperture(self) -> bool:
+        """kind=aperture: the timed work is drawing the pupil, not propagating it."""
+        return self.kind == "aperture"
+
+    def segmented_spec(self) -> dict:
+        """Layout spec for dragrace.apertures, with the case's own diameter."""
+        spec = self.segmented.to_spec()
+        spec["outer_diameter_m"] = self.pupil.diameter_m
+        return spec
+
+    @property
     def n_focus(self) -> int:
         """Samples across the observation plane.
 
         For a free-space case the observation grid *is* the illumination grid,
-        so this is N_p rather than a focal sampling derived from q.
+        so this is N_p rather than a focal sampling derived from q. An aperture
+        case has no second plane at all -- the drawn array is the whole output.
         """
-        return self.n_pupil if self.is_free_space else self.output.samples
+        if self.is_free_space or self.is_aperture:
+            return self.n_pupil
+        return self.output.samples
 
     @property
     def q(self) -> float:
@@ -291,11 +353,37 @@ class Case:
             p.append(f"dtype {self.dtype!r} not in {sorted(DTYPES)}")
         if self.n_across > self.n_pupil:
             p.append(f"samples_across_diameter ({self.n_across}) > array_samples ({self.n_pupil})")
-        if self.pupil.aperture != "circular":
-            p.append(f"aperture {self.pupil.aperture!r} unsupported (only 'circular')")
+        if self.pupil.aperture not in ("circular", "segmented"):
+            p.append(f"aperture {self.pupil.aperture!r} unsupported "
+                     f"(circular, or segmented for kind=aperture)")
+        if (self.pupil.aperture == "segmented") != self.is_aperture:
+            p.append("aperture: 'segmented' and kind: aperture go together; the "
+                     "propagation boards inject the harness's own mask and must "
+                     "not be handed a shape an adapter has to draw")
         if self.kind == "gradient" and self.parameters is None:
             p.append("kind=gradient requires a `parameters:` block")
-        if self.is_free_space:
+        if self.is_aperture:
+            if self.segmented is None:
+                p.append("kind=aperture requires a `segmented:` block")
+            if self.algorithm_class != "segmented_aperture":
+                p.append(
+                    f"kind=aperture needs algorithm_class 'segmented_aperture', "
+                    f"got {self.algorithm_class!r}"
+                )
+            if self.accuracy.reference != "internal_segmented_aperture":
+                p.append(
+                    f"kind=aperture must gate against 'internal_segmented_aperture'; "
+                    f"{self.accuracy.reference!r} is a propagation reference and has "
+                    f"no meaning for a drawn pupil"
+                )
+            if self.n_across != self.n_pupil:
+                p.append(
+                    f"kind=aperture draws the pupil across the whole array, so "
+                    f"array_samples ({self.n_pupil}) must equal "
+                    f"samples_across_diameter ({self.n_across}); a guard band would "
+                    f"only change the sampling, not the physics being drawn"
+                )
+        elif self.is_free_space:
             if self.propagation is None:
                 p.append("kind=plane_to_plane requires a `propagation:` block")
             if self.algorithm_class not in FREE_SPACE_CLASSES:
@@ -393,6 +481,7 @@ class Case:
         prop = d.pop("propagation", None)
         prop = Propagation(**{k: float(v) for k, v in prop.items()}) if prop else None
         params = d.pop("parameters", None)
+        seg = d.pop("segmented", None)
         scan = d.pop("scan", None)
         if scan is not None:
             scan = dict(scan)
@@ -404,6 +493,7 @@ class Case:
             execution=Execution(**(d.pop("execution", None) or {})),
             accuracy=Accuracy(**(d.pop("accuracy", None) or {})),
             parameters=Parameters(**params) if params else None,
+            segmented=Segmented(**seg) if seg else None,
             scan=Scan(**scan) if scan is not None else None,
             **d,
         )
@@ -419,6 +509,16 @@ class Case:
         return case
 
     def summary(self) -> str:
+        if self.is_aperture:
+            scan = ""
+            if self.is_scan:
+                scan = " scan " + self.scan.parameter + "=[" + ",".join(
+                    str(v) for v in sorted(self.scan.values)) + "]"
+            return (
+                f"{self.id}: {self.kind}/{self.segmented.layout}{scan} "
+                f"N={self.n_pupil} segments={self.segmented.n_segments} "
+                f"D={self.pupil.diameter_m:g}m spiders={self.segmented.spider_count}"
+            )
         if self.is_free_space:
             scan = ""
             if self.is_scan:

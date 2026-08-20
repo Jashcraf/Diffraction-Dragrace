@@ -32,6 +32,10 @@ def _row(r: dict, blocks: dict, path: Path, scan_param: str | None = None) -> di
         "config": r.get("config_id"),
         "mode": r.get("mode"),
         "status": blocks.get("status", r.get("status")),
+        # An aperture board measures drawing, not propagation, and the figures
+        # need to know which. Absent from results written before that board
+        # existed, so readers must tolerate None.
+        "case_kind": r.get("case_kind"),
         "machine": (r.get("machine") or {}).get("id"),
         "cpu": (r.get("machine") or {}).get("cpu"),
         # Results measured under different contracts are not comparable; the
@@ -144,6 +148,29 @@ def latest_axes(rows: list[dict]) -> dict[tuple, set]:
     return {k: ax for k, (_, ax) in newest.items() if ax}
 
 
+def case_kind_for(rows: list[dict], case_id: str) -> str | None:
+    """The `kind` of a case, from the results or failing that from the case file.
+
+    Results written before the aperture board existed carry no `case_kind`, and
+    they also carry an `ideal.flops` for it that has since been withdrawn -- N^2
+    "one write per pixel", which was a memory-traffic bound presented as an
+    arithmetic floor. Rather than reprice those files or re-run hours of
+    measurement, the readers below suppress the ideal line and the ideal row for
+    aperture cases outright. The kind is the honest discriminator, so it is
+    recovered from the case file when a result predates the field.
+    """
+    for r in rows:
+        if r.get("case") == case_id and r.get("case_kind"):
+            return r["case_kind"]
+    try:
+        import yaml
+        for p in Path("cases").rglob(f"{case_id}.yaml"):
+            return (yaml.safe_load(p.read_text()) or {}).get("kind")
+    except Exception:                                  # noqa: BLE001
+        pass
+    return None
+
+
 def _case_label(r: dict) -> str:
     return r["case"] if r.get("scan_value") is None else f"{r['case']}@{r['scan_value']}"
 
@@ -186,7 +213,9 @@ def render_scans(rows: list[dict]) -> list[str]:
 
         ideal = [next((r["ideal_gflop"] for r in sel
                        if r["scan_value"] == n and r["ideal_gflop"]), None) for n in sizes]
-        if all(i for i in ideal):
+        # Never for an aperture board: drawing a pupil has no arithmetic floor,
+        # so any figure here is invented. See case_kind_for.
+        if case_kind_for(pts, case) != "aperture" and all(i for i in ideal):
             out.append(f"{'ideal GFLOP':<16}" + "".join(f"{i:>11.3f}" for i in ideal))
     return out
 

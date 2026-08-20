@@ -125,6 +125,38 @@ def ideal_work(case: Case) -> Work:
         tops = 2 * n * n if case.basis_caching == "per_call" else 0.0
         return Work(flops, tops, isz * 4 * n * n, f"1 fft2({n}x{n}) + 2 chirp multiplies")
 
+    if cls == "segmented_aperture":
+        # NO FLOP FLOOR, deliberately, and flops=0 is what suppresses the ideal
+        # line on the figure and the ideal row in the table.
+        #
+        # Rasterisation has no derivable arithmetic requirement, so anything put
+        # here would be invented. An earlier version used N^2 -- one write per
+        # output pixel -- and it was worse than nothing on three counts. It is a
+        # memory-traffic bound wearing the label that means "the arithmetic the
+        # physics requires" everywhere else in this suite. It carries no
+        # information of its own, because plots.py anchors the ideal line through
+        # the fastest measured point, so only its slope is content and that slope
+        # is just N^2. And it does not bound the data: HCIPy runs 36.8 ms at
+        # N=256 against 43.5 at N=512, far flatter than N^2, so the line crossed
+        # the curves and invited the reading that a code was beating a physics
+        # floor.
+        #
+        # The question that line was meant to answer -- is this code O(N^2) or
+        # steeper -- is real, and POPPY is genuinely steeper. Log-log gridlines
+        # answer it without asserting a floor that does not exist.
+        #
+        # `tops` still carries the honest per-pixel count, which is a
+        # transcendental/op tally rather than a claim about required arithmetic.
+        seg = case.segmented
+        n = case.n_pupil
+        nseg = seg.n_segments if seg else 0
+        return Work(
+            0.0, float(n * n), isz // 2 * n * n,
+            f"{nseg} segments + {seg.spider_count if seg else 0} spiders onto "
+            f"{n}x{n}; no arithmetic floor -- rasterisation is memory-bound and "
+            f"any FLOP figure here would be invented, so none is reported"
+        )
+
     if cls == "czt":
         # Bluestein: per 1-D transform, 3 FFTs of length L plus 2 elementwise
         # passes; separable row-column over (N_p + N_f) lines. APPROXIMATE --

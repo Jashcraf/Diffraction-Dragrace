@@ -62,6 +62,10 @@ class PoppyAdapter(Adapter):
                 "astropy": astropy.__version__, "numpy": np.__version__}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_aperture:
+            if config.is_gpu:
+                return Unsupported("GPU config requires CuPy (env dragrace-gpu-cupy)")
+            return True
         if case.algorithm_class == "angular_spectrum":
             return Unsupported(
                 "POPPY's FresnelWavefront applies the paraxial transfer function "
@@ -167,10 +171,70 @@ class PoppyAdapter(Adapter):
                 return name
         return "numpy"
 
+    def _build_aperture(self, case: Case, config: Config):
+        """MultiHexagonAperture + SecondaryObscuration, composed and sampled.
+
+        POPPY has no ELT, so the pupil is assembled from the generic segmented
+        machinery its documentation teaches, and the segment selection is made
+        by matching POPPY's own `_aper_center` values against the canonical
+        layout rather than by index -- POPPY numbers "clockwise from the segment
+        immediately above centre", prysm counts from "up", and lentil follows
+        its own hex-ring order, so one index list cannot serve all three.
+
+        The central obscuration is NOT a SecondaryObscuration disc: the ELT's is
+        a hexagonal hole formed by leaving 61 segments out, and adding a circular
+        stop on top of that would obscure segments the real telescope has.
+        SecondaryObscuration is used only for the six spiders, with a zero
+        secondary radius.
+
+        Note POPPY's own warning on MultiHexagonAperture: "becomes a bit slow for
+        nrings > 4". The ELT needs 17, and that is a finding rather than a
+        misuse -- it is the documented way to build this pupil in POPPY.
+        """
+        import numpy as np
+        import astropy.units as u
+        import poppy
+        from dragrace.apertures import elt_segment_centres, select_for_centres
+
+        seg = case.segmented
+        f2f = seg.segment_flat_to_flat_m
+        probe = poppy.MultiHexagonAperture(
+            rings=seg.rings, flattoflat=f2f * u.m, gap=seg.segment_gap_m * u.m,
+            center=True)
+        n_all = probe._n_aper_inside_ring(seg.rings + 1)
+        # _aper_center documents itself as returning "y, x coords" -- reversed
+        # from every other centre convention in this comparison. Taken at face
+        # value its lattice looks rotated 30 degrees from the canonical layout
+        # (nearest-neighbour directions at 0/+-60/180 rather than +-30/+-90/+-150)
+        # and only 180 of the 798 segments match; the reversal is the whole
+        # difference, not a real disagreement about where the segments go.
+        centres = np.array([probe._aper_center(i) for i in range(n_all)],
+                           dtype=float)[:, ::-1]
+
+        canonical = elt_segment_centres(case.segmented_spec())
+        keep = select_for_centres(centres, canonical, tol=seg.segment_spacing_m * 0.25)
+        if len(keep) != seg.n_segments:
+            raise ValueError(
+                f"POPPY segment selection matched {len(keep)} of {seg.n_segments} "
+                f"canonical ELT segments -- its ring enumeration or _aper_center "
+                f"convention has moved. Failing rather than drawing the wrong "
+                f"telescope."
+            )
+        return {"case": case, "aperture": True,
+                "segmentlist": [int(i) for i in keep],
+                "rings": seg.rings, "f2f": f2f, "gap": seg.segment_gap_m,
+                "spider_count": seg.spider_count,
+                "spider_width": seg.spider_width_m,
+                "spider_offset": seg.spider_angle_offset_deg,
+                "npix": case.n_pupil, "grid_size": case.pupil.diameter_m}
+
     def build(self, case: Case, config: Config):
         """Untimed: the OpticalSystem a user would build once and reuse."""
         import astropy.units as u
         import poppy
+
+        if case.is_aperture:
+            return self._build_aperture(case, config)
 
         if case.kind == "plane_to_plane":
             # FresnelWavefront arrives with its own hard aperture of radius
@@ -230,6 +294,25 @@ class PoppyAdapter(Adapter):
         out the resulting normalisation anyway (validate.compare reports it as
         scale_abs), so nothing is lost by leaving POPPY's default in place.
         """
+        if state.get("aperture"):
+            import astropy.units as u
+            import poppy
+
+            segs = poppy.MultiHexagonAperture(
+                rings=state["rings"], flattoflat=state["f2f"] * u.m,
+                gap=state["gap"] * u.m, center=True,
+                segmentlist=state["segmentlist"])
+            optics = [segs]
+            if state["spider_count"]:
+                optics.append(poppy.SecondaryObscuration(
+                    secondary_radius=0.0 * u.m,
+                    n_supports=state["spider_count"],
+                    support_width=state["spider_width"] * u.m,
+                    support_angle_offset=state["spider_offset"]))
+            compound = poppy.CompoundAnalyticOptic(opticslist=optics, name="ELT")
+            return compound.sample(npix=state["npix"],
+                                   grid_size=state["grid_size"] * u.m)
+
         if state.get("free_space"):
             poppy, u = state["poppy"], state["u"]
             wf = poppy.FresnelWavefront(
@@ -261,9 +344,15 @@ class PoppyAdapter(Adapter):
         """
         if hasattr(result, "wavefront"):
             return np.asarray(result.wavefront)
+        if isinstance(result, np.ndarray):        # aperture board: a plain mask
+            return result
         return np.asarray(result[0].data)
 
     def complex_field(self, state, result) -> np.ndarray:
+        if state.get("aperture"):
+            # A drawn pupil is already the quantity being gated; there is no
+            # field to recover and nothing extra to pay for.
+            return self.to_host(result)
         if state.get("free_space"):
             return np.asarray(result.wavefront).astype(state["case"].dtype)
         return self._complex_field_calc_psf(state, result)

@@ -36,7 +36,20 @@ class Comparison:
     peak_offset_px: tuple[int, int]
     gate: str                # pass | fail
     reference: str
-    quantity: str = "field"  # field | intensity -- what was actually gated
+    quantity: str = "field"  # field | intensity | transmission -- what was gated
+    #: What `rel_l2` actually holds. Every propagation board fits a scale and
+    #: reports a relative L2 residual; the aperture board cannot, because the
+    #: codes disagree about antialiasing and an L2 would then gate on edge
+    #: treatment rather than on geometry. Naming the metric in the result keeps
+    #: the two from being read as the same number.
+    metric: str = "relative_l2"
+    #: Aperture board only. IoU of the binarised masks (the gated quantity
+    #: there), the open-area fractions either side, and the raw L2 that IoU
+    #: replaced -- reported so the edge disagreement stays visible.
+    iou: float | None = None
+    fill_fraction: float | None = None
+    fill_fraction_reference: float | None = None
+    edge_relative_l2: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -138,7 +151,92 @@ def compare_intensity(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparis
     )
 
 
+def compare_aperture(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparison:
+    """Gate a *drawn* pupil on geometry rather than on pixel values.
+
+    The aperture board is the one place where an L2 residual is the wrong gate.
+    These codes disagree about antialiasing by design -- HCIPy returns a
+    two-valued mask, prysm and lentil antialias their edges by default, POPPY
+    does its own thing -- and the ELT has 798 segments, so edge pixels are a
+    large fraction of the pupil at every size this scan reaches (~6% at
+    N=2048, more below it). An L2 gate would therefore reject codes for their
+    edge treatment, which is a modelling choice each is entitled to, while
+    saying almost nothing about whether they drew the right telescope.
+
+    So the gated number is `1 - IoU` of the masks binarised at half
+    transmission. Binarising splits an antialiased edge pixel the same way for
+    everyone, which makes IoU nearly blind to the thing that is legitimately
+    different and sharp about the things that are not: a missing central
+    obscuration, absent spiders, or segments the wrong size all move it by far
+    more than antialiasing does.
+
+    The raw L2 is not discarded -- it comes back as `edge_relative_l2`, which is
+    a decent proxy for how much antialiasing a code applies, and the two fill
+    fractions are reported alongside so "drew the right shape, wrong size" is
+    visible directly.
+    """
+    test = np.asarray(test, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    if test.shape != ref.shape:
+        raise ValueError(
+            f"shape mismatch: adapter drew {test.shape}, reference is {ref.shape}. "
+            f"Case {case.id!r} specifies a {case.n_pupil}x{case.n_pupil} pupil. An "
+            f"adapter whose aperture routine sizes its own output must resample or "
+            f"pad to the case grid in build(), not return its native size."
+        )
+
+    a = test > 0.5
+    b = ref > 0.5
+    union = int((a | b).sum())
+    iou = float((a & b).sum() / union) if union else 0.0
+
+    denom = float(np.linalg.norm(ref))
+    edge_l2 = float(np.linalg.norm(test - ref) / denom) if denom else float("inf")
+
+    # Centroid offset, in pixels: a whole-pupil shift is a centring convention
+    # difference and shows up here rather than as a mysteriously poor IoU.
+    def _centroid(m):
+        tot = m.sum()
+        if tot == 0:
+            return (0.0, 0.0)
+        yy, xx = np.indices(m.shape)
+        return (float((yy * m).sum() / tot), float((xx * m).sum() / tot))
+
+    cy_t, cx_t = _centroid(test)
+    cy_r, cx_r = _centroid(ref)
+
+    rel = 1.0 - iou
+    return Comparison(
+        rel_l2=rel,
+        scale_abs=1.0,
+        scale_phase_rad=None,
+        conjugated=None,
+        peak_ratio=float(test.max() / ref.max()) if ref.max() else float("inf"),
+        peak_offset_px=(int(round(cy_t - cy_r)), int(round(cx_t - cx_r))),
+        gate="pass" if rel <= case.accuracy.max_rel_l2 else "fail",
+        reference=case.accuracy.reference,
+        quantity="transmission",
+        metric="one_minus_iou",
+        iou=iou,
+        fill_fraction=float(test.mean()),
+        fill_fraction_reference=float(ref.mean()),
+        edge_relative_l2=edge_l2,
+    )
+
+
 def gate_message(c: Comparison, case: Case) -> str:
+    if c.metric == "one_minus_iou":
+        head = (f"geometry {'pass' if c.gate == 'pass' else 'FAIL'}: "
+                f"IoU={c.iou:.4f} (1-IoU={c.rel_l2:.3e} vs "
+                f"{case.accuracy.max_rel_l2:.1e})")
+        detail = (f"  fill={c.fill_fraction:.4f} against {c.fill_fraction_reference:.4f}, "
+                  f"antialiasing residual={c.edge_relative_l2:.3f}")
+        if c.gate == "pass":
+            return head
+        if c.peak_offset_px != (0, 0):
+            detail += (f", centroid offset {c.peak_offset_px} px -- a whole-pupil "
+                       f"shift is a centring convention, not a layout error")
+        return head + "." + detail
     if c.gate == "pass":
         return f"accuracy pass: rel_l2={c.rel_l2:.3e} <= {case.accuracy.max_rel_l2:.1e}"
     extra = ""

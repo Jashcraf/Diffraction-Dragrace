@@ -132,13 +132,23 @@ def _measure(ad, case, config, mode: str, out_dir: Path, adapter_name: str,
         # cost of asking it for the field must not land in the timing.
         centering = getattr(ad, "grid_centering", "pixel")
         quantity = getattr(ad, "output_quantity", "field")
-        compare = validate.compare_intensity if quantity == "intensity" else validate.compare
+        if case.is_aperture:
+            # A drawn pupil is a real transmission mask, so neither the complex
+            # field gate nor the dtype check applies: an aperture adapter returns
+            # float64 by construction and gating it as a field would compare a
+            # mask against a propagated wavefront.
+            compare = validate.compare_aperture
+        elif quantity == "intensity":
+            compare = validate.compare_intensity
+        else:
+            compare = validate.compare
         out = ad.complex_field(state, first)
-        metrics.verify_dtype(out, case)
+        if not case.is_aperture:
+            metrics.verify_dtype(out, case)
         cmp_ = compare(out, reference_field(case, centering), case)
         res["accuracy"] = cmp_.to_dict()
         res["accuracy"]["grid_centering"] = centering
-        if not case.pupil.aberration.coefficients:
+        if not case.pupil.aberration.coefficients and not case.is_aperture:
             phys = compare(out, airy_field(case, centering), case)
             res["accuracy"]["physics_check_analytic_airy"] = {
                 "rel_l2": phys.rel_l2, "peak_ratio": phys.peak_ratio,
@@ -219,6 +229,20 @@ def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict
             "n_focus": sub.n_focus,
         }
         try:
+            # supports() again, per point. run() already asked once against the
+            # scan case, but that carries the template size and a scan is
+            # precisely where an adapter's answer can change with N: lentil
+            # materialises every segment before flattening, so the ELT board
+            # costs it 8.5 GB at N=1024 and 34 GB at N=2048. Without this the
+            # large point takes the process down with it and the whole file is
+            # lost, including the sizes that measured cleanly -- an OOM kill
+            # writes no result.json at all.
+            sup = ad.supports(sub, config)
+            if not sup:
+                point.update(status="unsupported",
+                             reason=getattr(sup, "reason", "unsupported at this size"))
+                points.append(point)
+                continue
             point.update(_measure(ad, sub, config, mode, out_dir, adapter_name,
                                   tag=f"_{case.scan.parameter}{value}"))
         except Exception as exc:                       # noqa: BLE001
@@ -262,6 +286,11 @@ def run(case, config, adapter_name: str, mode: str,
     from .flops import ledger as ledger_mod
 
     res = _result_skeleton(case.id, config.id, adapter_name, mode)
+    # Recorded because the figures need it: an aperture board measures drawing,
+    # not propagation, and a y-axis reading "propagation time" there is simply
+    # wrong. Absent from results written before the aperture board existed, so
+    # readers of this field must tolerate None.
+    res["case_kind"] = case.kind
     res["machine"] = fingerprint.machine()
     res["provenance"] = fingerprint.provenance()
 

@@ -1,0 +1,131 @@
+# Drawing the ELT primary, scanned over array size.
+#
+# The only board in this suite where the timed call is not a propagation. Every
+# other case hands each adapter a pupil the harness rasterised and asks what it
+# costs to propagate; this one hands over a *specification* -- 798 hexagonal
+# segments, a hexagonal central obscuration and six spiders -- and asks what it
+# costs each library to draw it through whatever API its own documentation
+# teaches. Aperture construction is real work in any model that rebuilds its
+# pupil (a segment-phasing loop, a Monte Carlo over segment errors), and nothing
+# else here measures it.
+#
+# GEOMETRY is the E-ELT Construction Proposal, Fig. 3.66, and carries one trap
+# worth stating at the top of the file: the 1.45 m segment size is
+# VERTEX-TO-VERTEX, not flat-to-flat. Reading it the other way puts the segment
+# centres 1.454 m apart instead of 1.2597 m and builds a pupil ~15% too large
+# that still looks entirely plausible in a figure -- and no longer comes to 798
+# segments. dragrace.apertures owns the layout and asserts the count.
+#
+#   outer diameter        39.14634 m
+#   segments              798, 1.45 m vertex-to-vertex, 4 mm gaps, 17 rings
+#   central obscuration   9.4136 m flat-to-flat -- a hexagon, not a circle
+#   spiders               6 x 0.4 m at 60i + 30 degrees
+#
+# WHAT IS SCANNED is the array size N, with the pupil filling it exactly
+# (samples_across_diameter == array_samples). There is no guard band because
+# nothing is propagated -- the drawn array *is* the output.
+#
+#   array N    dx         px per segment    px per spider
+#      256     152.9 mm        8.2               2.6
+#      512      76.5 mm       16.4               5.2
+#     1024      38.2 mm       32.9              10.5
+#     2048      19.1 mm       65.7              20.9
+#
+# The scan stops below 128 deliberately: at N=128 a segment is 4 px across and
+# the codes' rasterisations differ by more than their algorithms do, so the
+# point would measure antialiasing conventions rather than drawing cost. The
+# 4 mm inter-segment gap is sub-pixel at every size on this scan (0.21 px even
+# at N=2048), which is a property of the real telescope rather than of the
+# sampling, and is why the gate below is geometric rather than pixel-exact.
+#
+# WHAT THE SLOPE MEANS, and it is the whole point of running this as a scan
+# rather than at one large N: a competent rasteriser tests each pixel against
+# the O(1) segments that could possibly cover it, so its cost grows as N^2. An
+# implementation that evaluates all 798 segments over the full array grows as
+# N^2 too, but with a 798x constant -- and one that rebuilds per-segment
+# coordinate grids grows faster still. Those are separated by the slope and the
+# offset together, not by a single measurement.
+#
+# The reference slope on this board is N^2 -- one write per output pixel -- and
+# it is a memory-traffic bound rather than an arithmetic one, because
+# rasterisation has no derivable FLOP floor. It is drawn like any other ideal
+# line, but it must not be read as "the physics requires this many operations";
+# it is only what touching the answer once costs.
+
+id: elt_segmented_scan
+kind: aperture
+algorithm_class: segmented_aperture
+
+# Unused: an aperture case draws a transmission mask and never propagates it.
+# Carried because Case requires it, and because an adapter that builds its
+# pupil inside a wavefront object still needs a wavelength to construct one.
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 39.14634
+  samples_across_diameter: 256   # template; replaced per scan point
+  array_samples: 256             # equal to the above -- the pupil fills the array
+  aperture: segmented
+
+segmented:
+  layout: elt
+  rings: 17
+  segment_vertex_to_vertex_m: 1.45      # NOT flat-to-flat; see above
+  segment_gap_m: 0.004
+  central_obscuration_flat_to_flat_m: 9.4136
+  spider_count: 6
+  spider_width_m: 0.4
+  spider_angle_offset_deg: 30.0
+  n_segments: 798
+
+dtype: complex128        # the drawn mask is real float64; this sets nothing here
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil
+  values: [256, 512, 1024, 2048]
+
+execution:
+  # Low relative to the propagation boards on purpose. The spread across these
+  # codes is three orders of magnitude -- HCIPy and prysm window each segment
+  # locally and finish in tens of milliseconds, lentil and POPPY evaluate every
+  # segment over the whole array and take minutes at N=2048 -- so 25 repeats
+  # would put the board in the hours. Five is enough for a median and a spread.
+  warmup: 1
+  repeats: 5
+  timeout_s: 1800.0
+
+accuracy:
+  # Gated on GEOMETRY, not on pixels: 1 - IoU of the masks binarised at half
+  # transmission, against dragrace.apertures.reference_mask. These codes
+  # disagree about antialiasing by design and the ELT has 798 segments, so edge
+  # pixels are ~6% of the pupil at N=2048 and more below it -- an L2 gate would
+  # reject codes for their edge treatment while barely noticing a missing
+  # central obscuration. Binarising splits an antialiased edge the same way for
+  # everyone. The raw L2 is still reported, as accuracy.edge_relative_l2.
+  #
+  # 0.05 is sized from measurement, not chosen for comfort. The reference
+  # reproduces HCIPy's hard-edged ELT at IoU = 1.00000, so the tolerance exists
+  # entirely for the antialiasing codes, whose disagreement is edge-dominated
+  # and therefore falls as 1/N: prysm scores 1-IoU = 0.044 at N=256, 0.026 at
+  # 512, 0.019 at 1024. A tolerance tight enough to be decisive at N=2048 would
+  # reject the same correct code at N=256 for resolving segments into 8 pixels.
+  #
+  # State plainly what this does NOT catch: six missing spiders move IoU by only
+  # ~0.023, which is inside this tolerance at the smaller sizes. The gate is a
+  # "did you draw the ELT" check, not a precision measurement. The real guard
+  # against a wrong pupil is structural and lives in the adapters -- each one
+  # matches its own segment centres against the canonical layout and raises if
+  # it cannot account for all 798 -- with the per-point IoU reported here so
+  # convergence stays visible.
+  reference: internal_segmented_aperture
+  max_rel_l2: 0.05
+
+notes: >
+  Aperture-drawing board. HCIPy has a purpose-built make_elt_aperture and is
+  expected to win outright; the interesting comparison is between the codes that
+  have to compose the ELT out of generic segmented-aperture machinery, and
+  between those that window each segment (prysm) and those that do not
+  (lentil, POPPY). Every adapter selects its segments by matching centres
+  against the canonical layout rather than by segment index, because the three
+  libraries that expose an index all number their rings differently.

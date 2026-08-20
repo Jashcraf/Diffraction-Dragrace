@@ -135,6 +135,13 @@ def reference_field(case: Case, centering="pixel") -> np.ndarray:
         return reference_angular_spectrum(case, centering)
     if which == "internal_fresnel_tf":
         return reference_fresnel_tf(case, centering)
+    if which == "internal_segmented_aperture":
+        # Owned by dragrace.apertures: the layout and its rasterisation live
+        # together, because the segment centres and the segment shapes have to
+        # agree about what "a hexagon of this size" means or the reference is
+        # self-inconsistent in a way no adapter could match.
+        from .apertures import reference_mask
+        return reference_mask(case, case.segmented_spec())
     raise ValueError(f"unknown accuracy.reference {which!r}")
 
 

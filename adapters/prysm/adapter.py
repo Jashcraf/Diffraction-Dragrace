@@ -48,6 +48,10 @@ class PrysmAdapter(Adapter):
         return {"prysm": getattr(prysm, "__version__", "unknown"), "numpy": np.__version__}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_aperture:
+            if config.is_gpu:
+                return Unsupported("GPU config requires CuPy (env dragrace-gpu-cupy)")
+            return True
         if case.algorithm_class == "angular_spectrum":
             return Unsupported(
                 "prysm's Wavefront.free_space applies the paraxial Fresnel transfer "
@@ -170,7 +174,63 @@ class PrysmAdapter(Adapter):
         }
 
     # ------------------------------------------------------------ lifecycle --
+    def _build_aperture(self, case: Case, config: Config):
+        """prysm's CompositeHexagonalAperture, plus spiders from prysm.geometry.
+
+        prysm has no ELT, so the pupil is composed the way its documentation
+        teaches: lay out a hexagonal composite and exclude the segments you do
+        not want. The exclude list is derived by matching prysm's own segment
+        centres against the canonical layout rather than by counting rings --
+        prysm, POPPY and lentil each number their segments differently, and an
+        index list written for one silently draws a different telescope in
+        another.
+
+        CompositeHexagonalAperture takes flat-to-flat, so the case's
+        vertex-to-vertex 1.45 m is converted here; getting that backwards is the
+        single easiest way to build a convincing pupil of the wrong size.
+        """
+        import numpy as np
+        from prysm.coordinates import make_xy_grid
+        from prysm.segmented import CompositeHexagonalAperture
+        from dragrace.apertures import elt_segment_centres, select_for_centres
+
+        seg = case.segmented
+        f2f = seg.segment_flat_to_flat_m
+        x, y = make_xy_grid(case.n_pupil, diameter=case.pupil.diameter_m)
+
+        # Read prysm's own segment centres out of an unexcluded composite rather
+        # than reimplementing its lattice: hex_to_xy's radius argument and
+        # hex_ring's "roll so the first element is north" are exactly the kind of
+        # convention that a reimplementation gets subtly wrong and that then
+        # shows up as a plausible pupil with the wrong segments missing. This
+        # construction is untimed -- it is the once-per-geometry work a user does
+        # to find their exclude list, which is what build() is for.
+        probe = CompositeHexagonalAperture(x, y, seg.rings, f2f, seg.segment_gap_m, 90)
+        centres = np.asarray(probe.all_centers, dtype=float)
+        spacing = seg.segment_spacing_m
+
+        canonical = elt_segment_centres(case.segmented_spec())
+        keep = select_for_centres(centres, canonical, tol=spacing * 0.25)
+        exclude = tuple(sorted(set(range(len(centres))) - set(keep.tolist())))
+        if len(keep) != seg.n_segments:
+            raise ValueError(
+                f"prysm segment selection matched {len(keep)} of {seg.n_segments} "
+                f"canonical ELT segments. prysm's ring enumeration or its "
+                f"hex_to_xy convention has moved; the exclude list would draw the "
+                f"wrong telescope, so this fails rather than producing a plot."
+            )
+
+        return {"case": case, "aperture": True, "x": x, "y": y,
+                "rings": seg.rings, "f2f": f2f, "gap": seg.segment_gap_m,
+                "exclude": exclude,
+                "spider_width": seg.spider_width_m,
+                "spider_count": seg.spider_count,
+                "spider_offset": seg.spider_angle_offset_deg}
+
     def build(self, case: Case, config: Config):
+        if case.is_aperture:
+            return self._build_aperture(case, config)
+
         from prysm.propagation import Wavefront, prepare_executor
 
         field = pupil_field(case, centering=self.grid_centering)
@@ -233,6 +293,26 @@ class PrysmAdapter(Adapter):
 
     def propagate(self, state):
         """Wavefront methods, which is how prysm documents propagation."""
+        if state.get("aperture"):
+            from prysm.geometry import spider
+            from prysm.segmented import CompositeHexagonalAperture
+
+            cha = CompositeHexagonalAperture(
+                state["x"], state["y"], state["rings"], state["f2f"],
+                state["gap"], 90, state["exclude"])
+            amp = cha.amp
+            if state["spider_count"]:
+                # prysm.geometry.spider returns the VANES (True where obscured),
+                # not the transmission -- measured fill 0.033 for six 0.4 m vanes
+                # on a 39 m pupil. Multiplying by it directly keeps only the
+                # spider, which is a mistake that produces a pupil so obviously
+                # wrong it fails the gate instantly rather than quietly.
+                vanes = spider(state["spider_count"], state["spider_width"],
+                               state["x"], state["y"],
+                               rotation=state["spider_offset"])
+                amp = amp * (1.0 - np.asarray(vanes, dtype=float))
+            return amp
+
         wf = state["wf"]
         if state["cls"] == "fresnel_tf":
             return wf.free_space(dz=state["dz_mm"], Q=1)

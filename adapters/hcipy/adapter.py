@@ -82,6 +82,12 @@ class HCIPyAdapter(Adapter):
         return {"hcipy": getattr(hcipy, "__version__", "unknown"), "numpy": np.__version__}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_aperture:
+            if case.segmented.layout != "elt":
+                return Unsupported(
+                    f"this adapter draws HCIPy's built-in ELT; no path for layout "
+                    f"{case.segmented.layout!r}")
+            return True
         if case.algorithm_class not in ("matrix_dft", "fft", "fresnel_tf", "angular_spectrum"):
             return Unsupported(f"no HCIPy path for {case.algorithm_class}")
         if case.algorithm_class == "angular_spectrum":
@@ -173,6 +179,25 @@ class HCIPyAdapter(Adapter):
     def build(self, case: Case, config: Config):
         import hcipy
 
+        if case.is_aperture:
+            # HCIPy is the only code in the suite that ships the ELT itself, and
+            # make_elt_aperture is exactly what its documentation puts in front
+            # of a user who wants one. Timing anything else here -- composing the
+            # same pupil out of make_hexagonal_segmented_aperture, say -- would
+            # measure a HCIPy nobody writes.
+            #
+            # The split is the same as everywhere else: build() gets the grid and
+            # the Field generator (a user hoists both out of a loop), propagate()
+            # evaluates the generator onto the grid, which is where the segments
+            # are actually drawn. HCIPy builds its segment list at generator
+            # construction, so that part is genuinely setup and is reported as
+            # setup.build_s rather than hidden.
+            grid = hcipy.make_pupil_grid(case.n_pupil, case.pupil.diameter_m)
+            gen = hcipy.make_elt_aperture(
+                normalized=False, with_spiders=case.segmented.spider_count > 0)
+            return {"case": case, "grid": grid, "gen": gen,
+                    "shape": (case.n_pupil, case.n_pupil), "aperture": True}
+
         if case.kind == "plane_to_plane":
             # FresnelPropagator, not AngularSpectrumPropagator: the case's
             # algorithm_class is fresnel_tf, and HCIPy's Fresnel transfer
@@ -221,9 +246,12 @@ class HCIPyAdapter(Adapter):
         return {"case": case, "prop": prop, "wf": wf, "shape": focal_grid.shape}
 
     def propagate(self, state):
+        if state.get("aperture"):
+            return state["gen"](state["grid"])
         return state["prop"](state["wf"])
 
     def to_host(self, result) -> np.ndarray:
-        ef = np.asarray(result.electric_field)
+        # An aperture case returns a real Field, a propagation a Wavefront.
+        ef = np.asarray(getattr(result, "electric_field", result))
         n = int(np.sqrt(ef.size))
         return ef.reshape(n, n)
