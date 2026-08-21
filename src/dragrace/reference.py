@@ -135,6 +135,12 @@ def reference_field(case: Case, centering="pixel") -> np.ndarray:
         return reference_angular_spectrum(case, centering)
     if which == "internal_fresnel_tf":
         return reference_fresnel_tf(case, centering)
+    if which == "internal_phase_retrieval":
+        # The truth coefficients -- what a correct retrieval must return. Not a
+        # field at all, which is why the worker routes this case to
+        # validate.compare_retrieval rather than to the field comparison.
+        from .retrieval import retrieval_parameters
+        return retrieval_parameters(case, centering)[1]
     if which == "internal_segmented_aperture":
         # Owned by dragrace.apertures: the layout and its rasterisation live
         # together, because the segment centres and the segment shapes have to

@@ -106,9 +106,14 @@ def focus_coords(case: Case, centering="pixel") -> np.ndarray:
     return _axis(case.n_focus, case.du_focus, centering_pair(centering)[1])
 
 
-def pupil_rho_theta(case: Case, centering="pixel") -> tuple[np.ndarray, np.ndarray]:
+def pupil_xy(case: Case, centering="pixel") -> tuple[np.ndarray, np.ndarray]:
+    """2-D pupil coordinates in units of D, on the case's grid."""
     x = pupil_coords(case, centering)
-    xx, yy = np.meshgrid(x, x, indexing="xy")
+    return np.meshgrid(x, x, indexing="xy")
+
+
+def pupil_rho_theta(case: Case, centering="pixel") -> tuple[np.ndarray, np.ndarray]:
+    xx, yy = pupil_xy(case, centering)
     return np.hypot(xx, yy), np.arctan2(yy, xx)
 
 
@@ -124,6 +129,65 @@ def circular_aperture(case: Case, centering="pixel") -> np.ndarray:
     """
     rho, _ = pupil_rho_theta(case, centering)
     return (rho <= 0.5).astype(np.float64)
+
+
+def obstructed_aperture(case: Case, centering="pixel") -> np.ndarray:
+    """Circular aperture, minus a secondary obscuration, minus spider vanes.
+
+    The phase-retrieval pupil. Hard-edged like every other mask the harness
+    injects, and for the same reason: each of these codes antialiases
+    differently, and here the difference would land inside a *loss function*
+    rather than merely inside an accuracy number -- two codes whose vane edges
+    disagree are minimising different functions and their iteration counts stop
+    being comparable.
+
+    Why the obstruction and the vanes are physics rather than decoration: an
+    unobstructed circular pupil is invariant under rotation, so its PSF cannot
+    distinguish the two members of a rotated pair of Zernike modes, and the
+    retrieval is degenerate in the astigmatism, coma and trefoil planes. The
+    vanes break that. What they do NOT break is the centro-symmetry that every
+    element here shares, so the twin ambiguity survives by construction -- OPD
+    phi(x) and -phi(-x) give the identical PSF. That is a property of
+    single-image phase retrieval, not of this implementation, and it is why the
+    gate below is data consistency rather than coefficient recovery.
+    """
+    ob = case.pupil.obstruction
+    if ob is None:
+        raise ValueError(
+            f"case {case.id!r} asks for an obstructed aperture but carries no "
+            f"`obstruction:` block")
+    xx, yy = pupil_xy(case, centering)
+    rho = np.hypot(xx, yy)
+
+    mask = (rho <= 0.5) & (rho >= 0.5 * ob.secondary_ratio)
+    half_width = 0.5 * ob.spider_width_ratio
+    for angle in ob.spider_angles_deg:
+        a = math.radians(angle)
+        # Perpendicular distance from the line through the origin at this angle,
+        # and the signed distance along it.
+        perp = np.abs(-math.sin(a) * xx + math.cos(a) * yy)
+        vane = perp <= half_width
+        if ob.spider_span == "radius":
+            vane &= (math.cos(a) * xx + math.sin(a) * yy) >= 0.0
+        mask &= ~vane
+    return mask.astype(np.float64)
+
+
+def aperture_mask(case: Case, centering="pixel") -> np.ndarray:
+    """The case's amplitude mask, whichever kind of pupil it declares.
+
+    A segmented pupil has no entry here on purpose: on that board the drawing is
+    the measurement, so the case hands the adapters a specification and each one
+    rasterises it itself (dragrace.apertures).
+    """
+    kind = case.pupil.aperture
+    if kind == "circular":
+        return circular_aperture(case, centering)
+    if kind == "obstructed":
+        return obstructed_aperture(case, centering)
+    raise ValueError(
+        f"no harness rasterisation for aperture {kind!r}; a segmented pupil is "
+        f"drawn by the adapter under test, not injected")
 
 
 # ----------------------------------------------------------------- Zernike --
@@ -161,9 +225,16 @@ def zernike_basis(case: Case, noll_indices: list[int], centering="pixel") -> np.
     disk; on a discrete grid it is only approximately unit RMS. Renormalising
     numerically makes "waves RMS" mean exactly that, so a coefficient is
     comparable across grid sizes -- which matters because N is a swept axis.
+
+    Normalised over the case's OWN mask, which for an obstructed pupil is the
+    annulus minus the vanes rather than the full disk. The modes are then unit
+    RMS over the area that actually transmits light, so "0.05 waves RMS" means
+    the same physical wavefront error whether or not the case carries a
+    secondary -- and it keeps the retrieval's parameter scaling independent of
+    the obscuration ratio.
     """
     rho, theta = pupil_rho_theta(case, centering)
-    mask = circular_aperture(case, centering) > 0
+    mask = aperture_mask(case, centering) > 0
     rho_unit = rho / 0.5                       # radius 0.5 -> unit disk
 
     modes = np.zeros((len(noll_indices), case.n_pupil, case.n_pupil), dtype=np.float64)
@@ -205,7 +276,7 @@ def pupil_field(case: Case, opd: np.ndarray | None = None, centering="pixel") ->
     factor -- this keeps the harness free of the metres-vs-microns unit slips
     that are otherwise a recurring source of cross-code disagreement.
     """
-    amp = circular_aperture(case, centering)
+    amp = aperture_mask(case, centering)
     if opd is None:
         opd = opd_waves(case, centering)
     field = amp * np.exp(2j * np.pi * opd)

@@ -66,6 +66,8 @@ class NumpyBaselineAdapter(Adapter):
         return {"numpy": np.__version__, "adapter": "0.1.0"}
 
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
         if case.algorithm_class not in ("matrix_dft", "fft", "angular_spectrum",
                                         "fresnel_tf"):
             return Unsupported(
@@ -88,6 +90,72 @@ class NumpyBaselineAdapter(Adapter):
                 "device": "cpu", "blas": detect_blas()}
 
     # ------------------------------------------------------------ lifecycle --
+    # ------------------------------------------------ phase-retrieval board --
+    #: On BOTH boards, because this is the floor rather than a competitor: it
+    #: answers "what does this retrieval cost if you just write it down" for the
+    #: finite-difference case and for the hand-adjoint case alike. plots.py draws
+    #: it as a corridor rather than a seventh line for the same reason.
+    retrieval_gradient = ("numerical", "analytic")
+
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: mask, basis, MFT kernel, and the observed PSF.
+
+        Written out here rather than delegating to dragrace.retrieval's
+        reference implementation, even though the arithmetic is the same. That
+        module is what the board is GATED against, and a reference sharing code
+        with the thing it validates is not a reference -- the same rule
+        reference.py states for reference_mft against this adapter's forward
+        propagation. Two independent spellings that have to agree is the whole
+        value; one spelling called twice is none.
+        """
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(case)
+        amp = aperture_mask(case)
+        x, u = pupil_coords(case), focus_coords(case)
+        kx = np.exp(-2j * np.pi * np.outer(u, x)).astype(np.complex128)
+        scale = case.dx_pupil ** 2
+
+        def field(theta):
+            opd = np.tensordot(theta, basis, axes=(0, 0))
+            w = amp * np.exp(2j * np.pi * opd)
+            return w, (kx @ w) @ kx.T * scale
+
+        observed = np.abs(field(theta_true)[1]) ** 2
+        s = loss_scale(observed)
+
+        def loss(theta):
+            inten = np.abs(field(theta)[1]) ** 2
+            return float(np.mean(((inten - observed) / s) ** 2))
+
+        def loss_and_grad(theta):
+            w, e = field(theta)
+            resid = (np.abs(e) ** 2 - observed) / s
+            # The 1/s appears twice: once in the residual and once again because
+            # the intensity it is differentiated against was scaled too.
+            ibar = 2.0 * resid / (resid.size * s)
+            ebar = ibar * np.conj(e)
+            wbar = (kx.T @ ebar) @ kx * scale
+            phsbar = -4.0 * np.pi * np.imag(wbar * w)
+            return float(np.mean(resid ** 2)), np.tensordot(
+                basis, phsbar, axes=([1, 2], [0, 1]))
+
+        analytic = case.retrieval.gradient == "analytic"
+        return {"case": case, "retrieval": True, "jac": analytic,
+                "fun": loss_and_grad if analytic else loss,
+                "psf": lambda th: np.abs(field(np.asarray(th, dtype=float))[1]) ** 2,
+                "theta0": theta_init, "loss_initial": loss(theta_init)}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(result, state["loss_initial"], state["case"],
+                           state["case"].n_focus ** 2)
+
+    # ------------------------------------------------------------ lifecycle --
     def build(self, case: Case, config: Config):
         """Untimed: pupil field, DFT kernels, padded scratch.
 
@@ -96,6 +164,9 @@ class NumpyBaselineAdapter(Adapter):
         construction are charged to the gradient board instead, where they are
         genuinely part of the differentiated chain.
         """
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
+
         field = pupil_field(case)
         state = {"case": case, "field": field, "cls": case.algorithm_class}
 
@@ -131,6 +202,10 @@ class NumpyBaselineAdapter(Adapter):
 
     def propagate(self, state):
         case = state["case"]
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], case, jac=state["jac"])
+
         if state["cls"] == "free_space":
             out = np.fft.ifft2(np.fft.fft2(state["field"]) * state["H"])
             return np.fft.fftshift(out)
@@ -145,6 +220,10 @@ class NumpyBaselineAdapter(Adapter):
         out = np.fft.fftshift(self._fft2(np.fft.ifftshift(big))) * state["scale"]
         nf = case.n_focus
         return out[crop:crop + nf, crop:crop + nf]
+
+    def to_host(self, result) -> np.ndarray:
+        """A retrieval returns an Outcome; the deliverable is its coefficients."""
+        return np.asarray(getattr(result, "theta", result))
 
     # ------------------------------------------------------ gradient board --
     def supports_gradient(self) -> bool | Unsupported:

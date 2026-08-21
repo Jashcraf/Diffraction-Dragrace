@@ -18,6 +18,11 @@ blas_backend: unknown
 threads: 1
 precision_override: complex64
 conda_env: dragrace-gpu-cupy
+conda_env_by_adapter:
+  # pip's jax[cuda12] vendors its own CUDA runtime and must not share an
+  # interpreter with conda's CUDA runtime for CuPy (envs/README.md). One
+  # config id, two environments -- the runner picks per adapter.
+  dlux: dragrace-gpu-jax
 env:
   XLA_PYTHON_CLIENT_PREALLOCATE: "false"
   JAX_ENABLE_X64: "0"

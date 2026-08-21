@@ -126,6 +126,52 @@ def gradient_theta(self, state) -> np.ndarray:   # the point of differentiation
 Without it the correctness gate is skipped, which means the board will happily
 publish a wrong gradient.
 
+## Phase-retrieval support (optional)
+
+```python
+retrieval_gradient = "numerical"   # or "analytic"; None means "not on this board"
+
+def supports(self, case, config):
+    if case.is_retrieval:
+        return self.retrieval_support(case, config)   # base-class gate
+    ...
+
+def build(self, case, config):
+    if case.is_retrieval:
+        return self._build_retrieval(case, config)    # returns fun/psf/theta0/...
+    ...
+
+def propagate(self, state):
+    if state.get("retrieval"):
+        return dragrace.retrieval.minimise(state["fun"], state["theta0"],
+                                           state["case"], jac=state["jac"])
+
+def retrieval_psf(self, state, theta) -> np.ndarray:   # untimed forward model
+def retrieval_report(self, state, result) -> dict:     # untimed diagnostics
+```
+
+Four things this contract exists to force, each of which produced a real bug:
+
+1. **Always call `retrieval.minimise`.** It applies the case's `ftol`, `gtol`,
+   `maxiter` and history length. An adapter that calls `scipy.optimize.minimize`
+   itself can silently stop on different criteria, and then its timing is not a
+   comparison with anything.
+2. **`retrieval_gradient` decides which board you appear on**, matched against
+   the case's `retrieval.gradient`. A code costing `P+1` forward models per
+   gradient must never share an axis with one costing `O(1)`.
+3. **`retrieval_psf` is not optional in practice.** Every code fits an observed
+   PSF its *own* forward model produced, so a wrong pupil converges beautifully
+   onto its own private physics and the coefficient gate passes. This is the
+   only check that would notice. It is untimed.
+4. **Check your analytic gradient against central differences**, in `tests/`.
+   A wrong gradient does not raise and does not fail a gate — L-BFGS-B partly
+   absorbs it into the step length, so the symptom is a *stall*, and a stall
+   reads as "this library is slow". See `docs/phase_retrieval_board.md` for the
+   double conjugation this caught in prysm's adjoint chain.
+
+`to_host()` must return the coefficient vector for a retrieval — the timed call
+returns a `retrieval.Outcome`, not an array.
+
 ## Checklist
 
 1. `adapters/<name>/adapter.py` implementing the contract.
@@ -158,3 +204,35 @@ publish a wrong gradient.
 - **Normalising to match the harness.** Don't. The validator fits and reports a
   complex scale factor; your library's own convention is fine and is worth
   recording.
+- **Advertising a path you did not implement.** This is the most dangerous
+  mistake on the list, because it produces a row that is *correct* and
+  *mislabelled*, which no gate can catch. `supports()` is a claim about which
+  board the adapter belongs on; the gates only check that the answer is right.
+  A code returning an MFT under an FFT label passes an `internal_mft`
+  accuracy gate at 1e-15 and lands on the FFT board, where its row reads as
+  "library X's FFT beats library Y's" when the two are not the same
+  computation. Found twice: dLux's `AngularOpticalSystem` reaches the focal
+  plane through `Wavefront.propagate`, which dLux's own docstring calls
+  "Legacy MFT propagation function", while `supports()` accepted
+  `algorithm_class == "fft"`; and POPPY's adapter docstring states plainly that
+  its `fft` and `fresnel_tf` paths are not implemented while `supports()`
+  still returns True for both. Before adding a class to `supports()`, follow
+  the call chain to the transform and confirm it is the one named.
+
+### The general rule the last two entries share
+
+A declaration is a claim, and every claim the harness renders into a label must
+be *verified against what happened*, never trusted. The same defect has now
+appeared in four unrelated places:
+
+| declared | what happened | how it was closed |
+|---|---|---|
+| `algorithm_class: fft` (dLux) | matrix DFT | `supports()` declines, with the reason |
+| `threads: 1` (dLux) | ~10 cores via XLA | measure `cpu_wall_ratio`, pin affinity |
+| `device: cpu` for retrieval (all) | correct, but a blanket refusal that outlived its cause | `retrieval_devices` per adapter |
+| `fft_backend: numpy` (POPPY) | pyFFTW, snapshotted at import | `accel_math.update_math_settings()` |
+
+Each was invisible in the results and each inverted a published ranking. The
+pattern to internalise: whenever a config axis or a case field becomes a column
+in a figure, ask what would happen if the adapter ignored it — and if the answer
+is "the row would look normal", the harness needs a measurement, not a promise.

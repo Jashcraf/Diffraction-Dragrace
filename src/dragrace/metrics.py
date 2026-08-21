@@ -33,6 +33,17 @@ class Timing:
     host_available: list[float] = field(default_factory=list)
     traced: bool = False
     unit: str = "s"
+    #: Process CPU seconds (user+sys) consumed across the timed region, and that
+    #: divided by the elapsed wall time. The second number is how many cores the
+    #: run actually used, and it exists because the config's `threads` field is
+    #: a REQUEST that one backend ignored: XLA honours none of the *_NUM_THREADS
+    #: variables and no XLA_FLAGS setting reaches its pool, so dLux ran on ~10
+    #: cores on every board here labelled threads=1 -- which on the
+    #: phase-retrieval board reversed its standing against prysm. Recording the
+    #: realised count makes that a visible number rather than a discovery.
+    #: ~1.0 means single-threaded; ~k means k cores.
+    cpu_seconds: float = 0.0
+    cpu_wall_ratio: float | None = None
 
     def _stats(self, xs: list[float]) -> dict[str, float]:
         if not xs:
@@ -72,6 +83,9 @@ def time_propagation(adapter, state: Any, warmup: int, repeats: int,
     for _ in range(warmup):
         adapter.sync(adapter.propagate(state))
 
+    # Bracket only the measured repeats, so warm-up threads do not inflate the
+    # realised core count.
+    cpu0, wall0 = _cpu_seconds(), perf_counter()
     for _ in range(repeats):
         t0 = perf_counter()
         out = adapter.propagate(state)
@@ -84,13 +98,32 @@ def time_propagation(adapter, state: Any, warmup: int, repeats: int,
 
         t.device_compute.append(t1 - t0)
         t.host_available.append((t1 - t0) + (t3 - t2))
+    _record_cpu(t, cpu0, wall0)
     return t
+
+
+def _cpu_seconds() -> float:
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
+def _record_cpu(t: Timing, cpu0: float, wall0: float) -> None:
+    """How many cores the timed region actually used.
+
+    Deliberately measured rather than taken from the config: `threads` is a
+    request, and the whole reason this field exists is that one backend ignored
+    it silently for the entire life of the repo.
+    """
+    elapsed = perf_counter() - wall0
+    t.cpu_seconds = _cpu_seconds() - cpu0
+    t.cpu_wall_ratio = (t.cpu_seconds / elapsed) if elapsed > 0 else None
 
 
 def time_gradient(adapter, state: Any, warmup: int, repeats: int) -> Timing:
     t = Timing(warmup=warmup, repeats=repeats)
     for _ in range(warmup):
         adapter.sync(adapter.gradient(state))
+    cpu0, wall0 = _cpu_seconds(), perf_counter()
     for _ in range(repeats):
         t0 = perf_counter()
         out = adapter.gradient(state)
@@ -98,6 +131,7 @@ def time_gradient(adapter, state: Any, warmup: int, repeats: int) -> Timing:
         t1 = perf_counter()
         t.device_compute.append(t1 - t0)
         t.host_available.append(t1 - t0)
+    _record_cpu(t, cpu0, wall0)
     return t
 
 

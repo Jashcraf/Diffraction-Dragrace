@@ -31,11 +31,28 @@ class Config:
     precision_override: str | None = None   # complex64 | complex128 | None
     env: dict[str, str] = field(default_factory=dict)
     conda_env: str | None = None            # which environment serves this config
+    #: Per-adapter overrides of `conda_env`, for configs one environment cannot
+    #: serve. The GPU configs are the case that forces this: pip's jax[cuda12]
+    #: wheels vendor their own CUDA runtime and must not share an interpreter
+    #: with conda's CUDA runtime for CuPy, so `gpu_f64` needs
+    #: dragrace-gpu-cupy for poppy/prysm and dragrace-gpu-jax for dLux. Two
+    #: config ids would be the wrong fix: `config` names the *machine
+    #: configuration* -- device, precision, FFT, BLAS -- and splitting it by
+    #: which Python packaging accident serves an adapter would put dLux-on-CUDA
+    #: and prysm-on-CUDA on separate boards, which is exactly the comparison the
+    #: GPU configs exist to make.
+    conda_env_by_adapter: dict[str, str] = field(default_factory=dict)
     notes: str = ""
 
     @property
     def is_gpu(self) -> bool:
         return self.device.startswith("cuda")
+
+    def env_for(self, adapter: str | None) -> str | None:
+        """The conda environment that serves `adapter` under this config."""
+        if adapter is None:
+            return self.conda_env
+        return self.conda_env_by_adapter.get(adapter, self.conda_env)
 
     @property
     def device_index(self) -> int:
@@ -78,19 +95,33 @@ class Config:
         precision against POPPY at double is not a comparison, so the flag
         follows the config's precision rather than whatever the shell had.
 
-        Threads: OMP_NUM_THREADS does not reach XLA, which runs its own Eigen
-        thread pool sized to the core count. Without this a run labelled
-        `threads=1` could quietly use every core -- the exact mislabelling the
-        backend verifier exists to prevent, arriving through a door it does not
-        watch. (Measured at N_p=1024 the flag makes dLux slightly *faster*,
-        16.4 ms against 18.2, so this costs nothing here; it is about the label
-        being true, not about speed.)
+        Threads: NOT SET HERE, because on this jaxlib no XLA_FLAGS setting can
+        do it. This block used to emit
+
+            --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=N
+
+        and both halves were inert. MEASURED on jaxlib 0.10.2, dLux at
+        N_p=1024: cpu/wall = 10.06 with no XLA_FLAGS at all, 10.04 with the
+        eigen flag, 9.92 with the full string -- i.e. ~10 cores in every case,
+        on a config labelled threads=1. `--xla_cpu_multi_thread_eigen` governed
+        the old Eigen path that the thunk runtime replaced, and
+        `--xla_cpu_use_thunk_runtime=false` does not bring it back (10.05).
+        `intra_op_parallelism_threads` is not an XLA flag at all: it is a
+        TensorFlow session option, and the only reason it never crashed the
+        worker is that it lacked the `--` prefix and was discarded as a
+        positional. Adding the prefix aborts the process --
+        "Unknown flag in XLA_FLAGS" -- so the string was one plausible-looking
+        cleanup away from taking every JAX run down with it.
+
+        What works is CPU affinity, applied by the worker before any import
+        (dragrace.worker.main). That is a property of the process rather than of
+        the library, so it constrains XLA's thread pool, OpenBLAS, MKL and
+        anything else that sizes itself from the core count -- and it is
+        verified after the fact by the cpu/wall ratio recorded in every timing
+        block, so a threads=1 row that used ten cores can no longer be published
+        as one that did not.
         """
-        e = {"JAX_ENABLE_X64": "0" if self.precision_override == "complex64" else "1"}
-        if not self.is_gpu:
-            e["XLA_FLAGS"] = (f"--xla_cpu_multi_thread_eigen={'false' if self.threads == 1 else 'true'} "
-                              f"intra_op_parallelism_threads={self.threads}")
-        return e
+        return {"JAX_ENABLE_X64": "0" if self.precision_override == "complex64" else "1"}
 
     def full_env(self) -> dict[str, str]:
         e = dict(self.thread_env())
@@ -107,6 +138,8 @@ class Config:
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         d = dict(d)
         d["env"] = {str(k): str(v) for k, v in (d.get("env") or {}).items()}
+        d["conda_env_by_adapter"] = {
+            str(k): str(v) for k, v in (d.get("conda_env_by_adapter") or {}).items()}
         cfg = cls(**d)
         cfg.validate()
         return cfg

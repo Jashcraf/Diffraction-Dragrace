@@ -67,6 +67,32 @@ def _prescription_free_space(wavelength, gridsize, PASSVALUE=None):
     return proper.prop_end(wfo, NOABS=True)
 
 
+def _prescription_psf(wavelength, gridsize, PASSVALUE=None):
+    """Pupil -> focus, returning the INTENSITY PSF -- the phase-retrieval model.
+
+    Identical optics to `_prescription` below; the difference is `prop_end`
+    without NOABS, which is what PROPER hands a user who wants a PSF rather than
+    a field, and is what the retrieval's loss is computed on.
+
+    The OPD is applied with prop_add_phase on every call, because it is the
+    thing being solved for. There is nothing to hoist: PROPER's prescriptions
+    are executed end to end against module-level global state, so a retrieval
+    re-runs prop_begin, the mask multiply, the lens and the propagation for each
+    of the ~300 forward models a finite-difference gradient needs. That is a
+    property of the API rather than of this adapter -- see the module docstring.
+    """
+    import proper
+
+    p = PASSVALUE or {}
+    wfo = proper.prop_begin(p["diam_m"], wavelength, gridsize, p["beam_ratio"])
+    proper.prop_multiply(wfo, p["mask"])
+    proper.prop_add_phase(wfo, p["opd_m"])
+    proper.prop_define_entrance(wfo)
+    proper.prop_lens(wfo, p["efl_m"])
+    proper.prop_propagate(wfo, p["efl_m"])
+    return proper.prop_end(wfo)
+
+
 def _prescription(wavelength, gridsize, PASSVALUE=None):
     """Pupil -> focus through a perfect lens. Module-level by necessity:
     PROPER executes prescriptions by name against global state.
@@ -110,7 +136,13 @@ class ProperAdapter(Adapter):
         return {"PyPROPER3": getattr(proper, "__version__", "3.3.4"),
                 "numpy": np.__version__}
 
+    #: PROPER has no adjoint and no AD backend, so the optimiser forms its own
+    #: gradient by finite differences: P+1 = 12 prescriptions per gradient.
+    retrieval_gradient = "numerical"
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
         if case.is_aperture:
             if config.is_gpu:
                 return Unsupported("PROPER has no GPU backend")
@@ -244,6 +276,90 @@ class ProperAdapter(Adapter):
         state["omit"] = sorted(set(range(len(centres))) - set(keep.tolist()))
         return state
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the padded mask, the basis, and the observed PSF.
+
+        PROPER is the one code on this board that does not reach the focal plane
+        by a Fourier transform. Its route is the physical one -- through a lens
+        and then a near-field Fresnel propagation over the focal length -- with
+        the focal sampling set by beam_ratio = 1/q rather than chosen. Two
+        consequences, both charged rather than papered over:
+
+          * The grid is q*N_D across, not N_D, because that is how PROPER
+            controls focal sampling. At q=2 every forward model transforms four
+            times the array an MFT code touches, and there are a few hundred of
+            them.
+          * Its PSF is not the exact Fourier transform the reference computes,
+            so the board's forward-model gate sees a small genuine difference
+            rather than roundoff. That is a modelling choice, not an error --
+            the same one that puts PROPER at 7.5e-5 on this suite's plain MFT
+            case -- which is why retrieval.max_forward_rel_l2 is set where it
+            is. PROPER still fits ITS OWN observed PSF, so its inverse problem
+            is as well conditioned as anyone else's.
+
+        Nothing else can be hoisted. PROPER executes a prescription end to end
+        against module-level global state, so prop_begin, the mask multiply, the
+        lens and the propagation all re-run per evaluation.
+        """
+        import numpy as np
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+
+        n = case.n_fft
+        off = n // 2 - case.n_pupil // 2
+        mask = np.zeros((n, n), dtype=np.float64)
+        mask[off:off + case.n_pupil, off:off + case.n_pupil] = aperture_mask(
+            case, self.grid_centering)
+        opd_m = np.zeros((n, n), dtype=np.float64)
+        crop = n // 2 - case.n_focus // 2
+        nf = case.n_focus
+        passvalue = {
+            "diam_m": case.pupil.diameter_m,
+            "efl_m": case.output.focal_length_m,
+            "beam_ratio": 1.0 / case.q,
+            "mask": mask,
+            "opd_m": opd_m,
+        }
+
+        def psf(theta):
+            # Written into the padded array in place: the prescription reads it
+            # by reference, and reallocating an n x n array a few hundred times
+            # would charge PROPER for the harness's bookkeeping.
+            opd_m[off:off + case.n_pupil, off:off + case.n_pupil] = np.tensordot(
+                np.asarray(theta, dtype=float), basis, axes=(0, 0)) * case.wavelength_m
+            out = _prescription_psf(case.wavelength_m, n, passvalue)
+            if isinstance(out, tuple):
+                out = out[0]
+            return np.asarray(out)[crop:crop + nf, crop:crop + nf]
+
+        observed = psf(theta_true)
+        s = loss_scale(observed)
+
+        def loss(theta):
+            return float(np.mean(((psf(theta) - observed) / s) ** 2))
+
+        return {"case": case, "retrieval": True, "jac": False, "fun": loss,
+                "psf": psf, "theta0": theta_init, "loss_initial": loss(theta_init)}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        # The one adapter whose computed focal plane is not the requested one.
+        # PROPER's focal sampling is set by beam_ratio = beam/grid, so reaching
+        # q=2 forces the whole (q*N_across)^2 field to be computed and cropped:
+        # 4194304 points against the 4096 asked for at N_p=1024, i.e. 99.90%
+        # discarded. Recorded per point so the table and the figure can say so.
+        case = state["case"]
+        return make_report(result, state["loss_initial"], case, case.n_fft ** 2,
+                           forward_model="proper prescription: prop_lens + "
+                                         "prop_propagate + prop_end")
+
     def build(self, case: Case, config: Config):
         """Almost empty by necessity -- see the module docstring.
 
@@ -251,6 +367,9 @@ class ProperAdapter(Adapter):
         grid. PROPER sizes its array from beam_ratio, so the mask is padded to
         gridsize with the aperture occupying N_D samples across, centred.
         """
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
+
         if case.is_aperture:
             return self._build_aperture(case, config)
 
@@ -297,6 +416,11 @@ class ProperAdapter(Adapter):
         }
 
     def propagate(self, state):
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
+
         if state.get("aperture"):
             import numpy as np
             import proper
@@ -336,3 +460,9 @@ class ProperAdapter(Adapter):
             out = out[0]
         c, npix = state["crop"]
         return np.asarray(out)[c:c + npix, c:c + npix]
+
+    def to_host(self, result) -> np.ndarray:
+        """A retrieval returns an Outcome; the deliverable is its coefficients."""
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
+        return np.asarray(result)

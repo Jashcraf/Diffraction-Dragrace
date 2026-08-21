@@ -61,7 +61,20 @@ class PoppyAdapter(Adapter):
         return {"poppy": getattr(poppy, "__version__", "unknown"),
                 "astropy": astropy.__version__, "numpy": np.__version__}
 
+    #: POPPY has no adjoint and no AD backend, so the optimiser forms its own
+    #: gradient by finite differences: P+1 = 12 calc_psf calls per gradient.
+    retrieval_gradient = "numerical"
+
+    #: POPPY's own device switch is poppy.conf.use_cuda, which accel_math reads
+    #: for every FFT and every elementwise step, so the propagation inside
+    #: calc_psf moves to the GPU without this adapter holding any device arrays
+    #: itself. What stays on the host is the OPD assembly and the loss, which is
+    #: the same host/device split scipy's optimiser forces on every code here.
+    retrieval_devices = ("cpu", "gpu")
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
         if case.is_aperture:
             if config.is_gpu:
                 return Unsupported("GPU config requires CuPy (env dragrace-gpu-cupy)")
@@ -228,10 +241,83 @@ class PoppyAdapter(Adapter):
                 "spider_offset": seg.spider_angle_offset_deg,
                 "npix": case.n_pupil, "grid_size": case.pupil.diameter_m}
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the OpticalSystem, the basis, and the observed PSF.
+
+        WHAT IS HOISTED AND WHAT IS NOT. The OpticalSystem, its detector and the
+        pupil optic are built once here, and the forward model swaps the OPD
+        array on the pupil plane before each calc_psf. That is the contract this
+        suite applies everywhere -- everything the API permits hoisting is
+        hoisted -- and it is not generous to POPPY: calc_psf still rebuilds its
+        input wavefront and re-applies every optic on every call
+        (poppy_core.propagate_mono), which is the bulk of what POPPY costs and
+        is charged in full. Rebuilding the whole OpticalSystem per call instead
+        would measure object construction, which no user would leave in a
+        retrieval loop after seeing the first profile.
+
+        ArrayOpticalElement carries `opd` as a plain attribute and `get_opd`
+        returns it unmodified -- it is an OpticalElement, not an
+        AnalyticOpticalElement, so there is no phasor cache to go stale behind
+        the swap. That is checked by the board's own forward-model gate, which
+        would catch a POPPY that kept returning the first PSF.
+
+        The Zernike basis is the harness's rather than poppy.zernike's, for the
+        reason set out in dragrace.retrieval: theta has to mean the same
+        wavefront in all six codes or they are not solving the same problem.
+        POPPY is still charged for turning that OPD into a PSF.
+        """
+        import astropy.units as u
+        import poppy
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        amp = aperture_mask(case, self.grid_centering)
+        array_extent_m = case.pupil.diameter_m * case.n_pupil / case.n_across
+        pixelscale_arcsec = np.degrees(
+            case.wavelength_m / case.pupil.diameter_m / case.q) * 3600.0
+
+        pupil = poppy.ArrayOpticalElement(
+            transmission=amp, opd=np.zeros_like(amp),
+            pixelscale=(case.dx_pupil_m * u.m / u.pixel))
+        osys = poppy.OpticalSystem(npix=case.n_pupil, oversample=1,
+                                   pupil_diameter=array_extent_m * u.m)
+        osys.add_pupil(pupil)
+        osys.add_detector(pixelscale=pixelscale_arcsec, fov_pixels=case.n_focus)
+        wavelength = case.wavelength_m * u.m
+
+        def psf(theta):
+            pupil.opd = np.tensordot(np.asarray(theta, dtype=float), basis,
+                                     axes=(0, 0)) * case.wavelength_m
+            return np.asarray(osys.calc_psf(wavelength=wavelength)[0].data)
+
+        observed = psf(theta_true)
+        s = loss_scale(observed)
+
+        def loss(theta):
+            return float(np.mean(((psf(theta) - observed) / s) ** 2))
+
+        return {"case": case, "retrieval": True, "jac": False, "fun": loss,
+                "psf": psf, "theta0": theta_init, "loss_initial": loss(theta_init)}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(result, state["loss_initial"], state["case"],
+                           state["case"].n_focus ** 2,
+                           forward_model="poppy.OpticalSystem.calc_psf")
+
     def build(self, case: Case, config: Config):
         """Untimed: the OpticalSystem a user would build once and reuse."""
         import astropy.units as u
         import poppy
+
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
 
         if case.is_aperture:
             return self._build_aperture(case, config)
@@ -294,6 +380,11 @@ class PoppyAdapter(Adapter):
         out the resulting normalisation anyway (validate.compare reports it as
         scale_abs), so nothing is lost by leaving POPPY's default in place.
         """
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
+
         if state.get("aperture"):
             import astropy.units as u
             import poppy
@@ -341,7 +432,11 @@ class PoppyAdapter(Adapter):
         Extension 0 is the computed (here also detector-sampled, since
         oversample=1) PSF. Timed as the device->host cost like any other
         adapter's; the accuracy gate reads complex_field() instead.
+
+        A retrieval returns an Outcome; the deliverable is its coefficients.
         """
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         if hasattr(result, "wavefront"):
             return np.asarray(result.wavefront)
         if isinstance(result, np.ndarray):        # aperture board: a plain mask

@@ -50,6 +50,15 @@ class Comparison:
     fill_fraction: float | None = None
     fill_fraction_reference: float | None = None
     edge_relative_l2: float | None = None
+    #: Phase-retrieval board only. `rel_l2` there is the coefficient error over
+    #: the OBSERVABLE modes; these carry the same error over all P (piston
+    #: included, which no PSF can constrain), the worst single mode in waves,
+    #: and the distance to the twin solution -- so a run that converged to the
+    #: sign-flipped wavefront is diagnosable from the result file alone instead
+    #: of looking like a generic accuracy failure.
+    coefficient_rel_l2_all: float | None = None
+    max_coefficient_error_waves: float | None = None
+    twin_rel_l2: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,8 +134,34 @@ def compare_intensity(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparis
             f"Case {case.id!r} specifies N_f={case.n_focus} on the canonical focal grid."
         )
 
-    t = np.abs(test.astype(np.complex128)) ** 2
-    r = np.abs(ref) ** 2
+    return compare_psf(np.abs(test.astype(np.complex128)) ** 2, np.abs(ref) ** 2,
+                       case, case.accuracy.max_rel_l2, case.accuracy.reference)
+
+
+def compare_psf(test: np.ndarray, ref: np.ndarray, case: Case,
+                max_rel_l2: float, reference: str,
+                quantity: str = "intensity") -> Comparison:
+    """Compare two real intensity PSFs, fitting out one overall scale.
+
+    The scale has to be fitted because these codes disagree about PSF
+    normalisation by design -- POPPY divides by the entrance flux, prysm carries
+    dx^2, HCIPy does neither -- and none of those is wrong. What is left after
+    one scale factor is a real disagreement about the optics.
+
+    Split out from compare_intensity so the phase-retrieval board can reuse it
+    with its own tolerance: there this compares each code's forward model
+    against the harness reference at the truth coefficients, which is a
+    different question with a different acceptable error from a propagation
+    board's gate.
+    """
+    t = np.asarray(test, dtype=np.float64)
+    r = np.asarray(ref, dtype=np.float64)
+    if t.shape != r.shape:
+        raise ValueError(
+            f"shape mismatch: adapter returned {t.shape}, reference is {r.shape}. "
+            f"Case {case.id!r} specifies N_f={case.n_focus} on the canonical focal grid."
+        )
+
     denom = float((r * r).sum())
     a = float((t * r).sum() / denom) if denom else float("inf")
     scale = np.linalg.norm(a * r)
@@ -145,9 +180,9 @@ def compare_intensity(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparis
         conjugated=None,
         peak_ratio=peak_ratio,
         peak_offset_px=(int(ti[0] - ri[0]), int(ti[1] - ri[1])),
-        gate="pass" if rel <= case.accuracy.max_rel_l2 else "fail",
-        reference=case.accuracy.reference,
-        quantity="intensity",
+        gate="pass" if rel <= max_rel_l2 else "fail",
+        reference=reference,
+        quantity=quantity,
     )
 
 
@@ -224,7 +259,82 @@ def compare_aperture(test: np.ndarray, ref: np.ndarray, case: Case) -> Compariso
     )
 
 
+def compare_retrieval(test: np.ndarray, ref: np.ndarray, case: Case) -> Comparison:
+    """Gate a recovered Zernike coefficient vector against the truth.
+
+    The gated number is the relative L2 error over the OBSERVABLE modes. Piston
+    is excluded from it because a PSF cannot see piston at all -- dL/dtheta_1 is
+    identically zero, measured at 7.5e-20 through reverse-mode AD -- so the
+    optimiser leaves it wherever it started and including it would charge every
+    code for a mode none of them could possibly recover. It is not swept away:
+    `coefficient_rel_l2_all` reports the error with piston in.
+
+    The distance to the twin solution is reported alongside, because that is the
+    one failure this board is genuinely exposed to and it needs to be
+    distinguishable from ordinary inaccuracy. A pupil that is centro-symmetric
+    makes OPD phi(x) and -phi(-x) give the identical PSF; a code that converged
+    there scores rel_l2 ~ 1.27 and twin_rel_l2 ~ 0, which says "found the other
+    valid answer" rather than "computed something wrong".
+    """
+    from .retrieval import observable_slice, twin_coefficients
+
+    test = np.asarray(test, dtype=np.float64).ravel()
+    ref = np.asarray(ref, dtype=np.float64).ravel()
+    if test.shape != ref.shape:
+        raise ValueError(
+            f"coefficient shape mismatch: adapter returned {test.shape}, the case "
+            f"specifies {ref.shape} (P={case.retrieval.count} Noll modes starting "
+            f"at {case.retrieval.first_noll})."
+        )
+
+    def _rel(a: np.ndarray, b: np.ndarray) -> float:
+        denom = float(np.linalg.norm(b))
+        return float(np.linalg.norm(a - b) / denom) if denom else float("inf")
+
+    sl = observable_slice(case)
+    rel = _rel(test[sl], ref[sl])
+    twin = twin_coefficients(case, ref)
+
+    norm_t, norm_r = float(np.linalg.norm(test[sl])), float(np.linalg.norm(ref[sl]))
+    return Comparison(
+        rel_l2=rel,
+        # No normalisation is fitted out here, unlike a field comparison: a
+        # coefficient vector is already in physical units (waves RMS), so a
+        # scale factor would be a real error rather than a convention.
+        scale_abs=(norm_t / norm_r) if norm_r else float("inf"),
+        scale_phase_rad=None,
+        conjugated=None,
+        peak_ratio=(norm_t / norm_r) if norm_r else float("inf"),
+        peak_offset_px=(0, 0),
+        gate="pass" if rel <= case.accuracy.max_rel_l2 else "fail",
+        reference=case.accuracy.reference,
+        quantity="zernike_coefficients",
+        metric="coefficient_relative_l2",
+        coefficient_rel_l2_all=_rel(test, ref),
+        max_coefficient_error_waves=float(np.max(np.abs(test[sl] - ref[sl])))
+        if test[sl].size else 0.0,
+        twin_rel_l2=_rel(test[sl], twin[sl]),
+    )
+
+
 def gate_message(c: Comparison, case: Case) -> str:
+    if c.metric == "coefficient_relative_l2":
+        head = (f"retrieval {'pass' if c.gate == 'pass' else 'FAIL'}: coefficient "
+                f"rel_l2={c.rel_l2:.3e} over the observable modes (vs "
+                f"{case.accuracy.max_rel_l2:.1e})")
+        if c.gate == "pass":
+            return head
+        detail = (f". Worst mode off by {c.max_coefficient_error_waves:.3e} waves; "
+                  f"with piston included rel_l2={c.coefficient_rel_l2_all:.3e}")
+        if c.twin_rel_l2 is not None and c.twin_rel_l2 < c.rel_l2:
+            detail += (f". This is the TWIN SOLUTION -- distance to it is "
+                       f"{c.twin_rel_l2:.3e}, closer than to the truth. The optimiser "
+                       f"found a wavefront that reproduces the PSF equally well, "
+                       f"which means this case's pupil is centro-symmetric enough "
+                       f"for the two to be indistinguishable. Not an accuracy bug: "
+                       f"see src/dragrace/retrieval.py on spider_span")
+        return head + detail
+
     if c.metric == "one_minus_iou":
         head = (f"geometry {'pass' if c.gate == 'pass' else 'FAIL'}: "
                 f"IoU={c.iou:.4f} (1-IoU={c.rel_l2:.3e} vs "

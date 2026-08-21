@@ -143,19 +143,25 @@ def _excluded(rows: list[dict], case: str, config: str, mode: str, machine: str,
             and (r["adapter"], r["scan_value"]) not in plotted]
 
 
+#: What one timed iteration actually was, per case kind. The generic label is
+#: not merely imprecise on these boards -- it names an operation that did not
+#: happen. A phase-retrieval iteration is a whole nonlinear optimisation,
+#: hundreds of forward models, which is also why its numbers are seconds where
+#: every other board's are milliseconds.
+_Y_LABELS = {
+    "aperture": "median aperture drawing time (ms)",
+    "phase_retrieval": "median time for one complete retrieval (ms)",
+}
+
+
 def _y_label(lines: dict[str, list[dict]], case_id: str) -> str:
     """What the timed region measured, in the axis label.
 
-    The aperture board draws a pupil and never propagates anything, so the
-    generic label is not merely imprecise there -- it names an operation that did
-    not happen. `case_kind` is read from the results, and falls back to the case
-    file for results written before that field existed rather than mislabelling
-    them.
+    `case_kind` is read from the results, and falls back to the case file for
+    results written before that field existed rather than mislabelling them.
     """
     flat = [r for pts in lines.values() for r in pts]
-    if case_kind_for(flat, case_id) == "aperture":
-        return "median aperture drawing time (ms)"
-    return "median propagation time (ms)"
+    return _Y_LABELS.get(case_kind_for(flat, case_id), "median propagation time (ms)")
 
 
 #: Reason substrings -> the short phrase put on the chart. A curve that stops
@@ -400,6 +406,25 @@ def plot_scans(rows: list[dict], out_dir: str | Path, fmt: str = "png",
                 caption += (f" — {', '.join(sorted(mixed))} "
                             f"{'use' if len(mixed) > 1 else 'uses'} a different engine "
                             f"from the rest; not a like-for-like backend comparison")
+        # A retrieval board can legitimately mix algorithm classes -- PROPER has
+        # no matrix-DFT path at all -- and an FFT-based code cannot choose its
+        # focal sampling, so it computes the entire plane and crops. Without
+        # this line a reader takes its curve for a slower propagator, when a
+        # large part of what separates it is that it was asked for 4096 samples
+        # and had to compute four million.
+        over = {}
+        for adapter, pts in lines.items():
+            ratios = [r["focal_computed"] / r["focal_requested"] for r in pts
+                      if r.get("focal_computed") and r.get("focal_requested")
+                      and r["focal_computed"] > r["focal_requested"]]
+            if ratios:
+                over[adapter] = max(ratios)
+        if over:
+            caption += ("\n" + "; ".join(
+                f"{a} computes {v:.0f}x the focal samples this case asks for "
+                f"(FFT sampling is set by beam/grid, so the whole plane is "
+                f"computed and cropped)" for a, v in sorted(over.items())))
+
         plotted = {(a, r["scan_value"]) for a, pts in lines.items() for r in pts}
         skipped = [r for r in _excluded(rows, case_id, config_id, mode, machine, plotted)
                    if r.get("contract") == contract]

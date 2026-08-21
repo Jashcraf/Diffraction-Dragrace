@@ -66,13 +66,26 @@ class DLuxAdapter(Adapter):
     #: mislabel or, worse, letting it pass unremarked. dLux belongs on the board
     #: -- XLA is not an alternative backend for it, it is the only one -- but a
     #: dLux row is never a data point in a backend comparison.
-    #: threads is here too, and for a different reason from fft/blas: XLA does
-    #: have a thread pool, but threadpoolctl cannot see it and the XLA_FLAGS
-    #: knobs produced identical timings at 1 and 8 threads when tested, so the
-    #: harness cannot verify the count. Declaring it keeps a dLux row out of any
-    #: thread-scaling comparison instead of letting NumPy's idle OpenBLAS stand
-    #: in as evidence.
-    config_axes_not_selectable = ("fft", "blas", "threads")   # refined in configure()
+    #: threads is NOT in this list any more, and the story of why it was is the
+    #: reason the harness now measures cpu/wall on every timed region.
+    #:
+    #: It used to be declared unselectable on the grounds that "the XLA_FLAGS
+    #: knobs produced identical timings at 1 and 8 threads when tested". The
+    #: timings were indeed identical -- because the knobs did nothing, and XLA
+    #: used every core at both settings. Measured on jaxlib 0.10.2 at N_p=1024,
+    #: cpu/wall = 10.06 with no XLA_FLAGS, 10.04 with
+    #: --xla_cpu_multi_thread_eigen=false, 10.05 with the thunk runtime
+    #: disabled: ~10 cores throughout, on boards labelled threads=1. On the
+    #: phase-retrieval board that reversed dLux's standing against prysm --
+    #: 877 ms against 1353 unpinned, 2117 against 1737 with both held to one
+    #: core. "Cannot verify" had quietly become "is not true".
+    #:
+    #: dragrace.worker._pin_cpus now enforces the axis with CPU affinity, which
+    #: is a property of the process that XLA cannot opt out of, and
+    #: metrics.Timing records the realised core count so the claim is checked
+    #: rather than asserted. The axis is therefore honoured, and saying
+    #: otherwise would put a false caveat on a figure that no longer needs one.
+    config_axes_not_selectable = ("fft", "blas")   # refined in configure()
 
     #: Measured peak-memory model for the aperture board, and it had to be
     #: measured. The obvious estimate -- one float64 per segment per pixel,
@@ -106,7 +119,31 @@ class DLuxAdapter(Adapter):
             out["dLux"] = "not installed"
         return out
 
+    #: JAX differentiates the whole dLux optical system, so the forward model
+    #: returns (loss, dloss/dtheta) and the optimiser never forms a difference
+    #: quotient.
+    retrieval_gradient = "analytic"
+
+    #: The optimisation runs inside jax.lax.while_loop on whatever device the
+    #: config selects, so unlike the scipy-driven adapters nothing crosses the
+    #: host boundary per iteration -- only the final theta comes back. That is a
+    #: real architectural difference on the GPU board and not a measurement
+    #: artefact: it is the reason to write a retrieval in JAX.
+    retrieval_devices = ("cpu", "gpu")
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            sup = self.retrieval_support(case, config)
+            if not sup:
+                return sup
+            try:
+                import optax  # noqa: F401
+            except ImportError:
+                return Unsupported(
+                    "optax is not installed; the analytic board drives dLux with "
+                    "optax.lbfgs rather than scipy, so that JAX never has to leave "
+                    "the device between iterations")
+            return True
         if case.is_aperture:
             from dragrace.apertures import APERTURE_MEMORY_BUDGET_BYTES
             need = self._aperture_peak_bytes(case)
@@ -130,7 +167,33 @@ class DLuxAdapter(Adapter):
                 "despite the name: it matches an internal_fresnel_tf reference to "
                 "2.78e-13 and an exact angular-spectrum one only to 4.07e-6, which is "
                 "precisely the exact-vs-paraxial difference. Use fresnel_d50_z1m.")
-        if case.algorithm_class not in ("matrix_dft", "fft", "fresnel_tf"):
+        if case.algorithm_class == "fft":
+            # Declined even though dLux CAN do this, because this adapter does
+            # not. AngularOpticalSystem.propagate_mono ends in `to_focus`, which
+            # calls Wavefront.propagate -- dLux's own docstring for it opens
+            # "Legacy MFT propagation function". So a run here would compute a
+            # matrix DFT and file it on the FFT board.
+            #
+            # Nothing would catch that. fft_array_scan gates against
+            # `internal_mft`, the same reference an MFT case uses, because both
+            # must land on the same focal grid -- so the wrong algorithm returns
+            # the right answer and passes. The row would then be read as "dLux's
+            # FFT is faster than PROPER's", when the two are not the same
+            # computation at all: reaching q=4 costs an FFT a (q*N_p)^2
+            # transform and costs an MFT nothing beyond N_p^2 x N_f.
+            #
+            # dLux exposes Wavefront.propagate_FFT, so an honest FFT path is
+            # implementable; until one exists and is verified, declining is the
+            # only answer that does not publish a mislabel.
+            return Unsupported(
+                "this adapter reaches the focal plane through "
+                "AngularOpticalSystem, whose to_focus() calls Wavefront.propagate "
+                "-- documented by dLux as 'Legacy MFT propagation function'. It "
+                "would compute a matrix DFT and pass this case's internal_mft "
+                "gate, putting an MFT row on the FFT board. dLux does expose "
+                "Wavefront.propagate_FFT; wiring it up is the fix, not relaxing "
+                "this. Use mft_array_scan / mft_n1024_q4 meanwhile.")
+        if case.algorithm_class not in ("matrix_dft", "fresnel_tf"):
             return Unsupported(f"no dLux path for {case.algorithm_class}")
         try:
             import jax  # noqa: F401
@@ -157,11 +220,13 @@ class DLuxAdapter(Adapter):
             return Unsupported(f"config wants {config.device} but jax.devices()={jax.devices()}")
         self._device = jax.devices("gpu" if want_gpu else "cpu")[0]
         self._gpu = want_gpu
-        # blas and threads never apply. The FFT axis does apply on a config that
+        # blas never applies -- XLA emits its own kernels. threads DOES apply
+        # now, enforced by process affinity rather than by anything XLA exposes
+        # (see the class attribute above). The FFT axis applies on a config that
         # asks for XLA -- there the config and the adapter agree, and saying
         # otherwise would put a spurious "mixed backends" caveat on a figure
         # where every line runs the same engine.
-        axes = ["blas", "threads"]
+        axes = ["blas"]
         if config.fft_backend not in ("xla", "native"):
             axes.insert(0, "fft")
         self.config_axes_not_selectable = tuple(axes)
@@ -301,8 +366,157 @@ class DLuxAdapter(Adapter):
             lambda: pupil.transmission(coords, pixel_scale)).lower().compile()
         return {"case": case, "aperture": True, "fn": compiled}
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the optical system, the loss, and the AOT-compiled retrieval.
+
+        THE WHOLE OPTIMISATION IS ONE COMPILED XLA PROGRAM. That is the point of
+        putting dLux on this board rather than driving it from scipy: with
+        scipy's L-BFGS-B the loop lives in Python and every iteration crosses the
+        host/device boundary twice, which at these array sizes costs more than
+        the propagation. Compiling the loop keeps JAX on-device from the
+        starting guess to convergence, and it is what a dLux user would write.
+        The price is a real compile, which lands in setup.first_call_s exactly as
+        it does on the propagation boards -- seconds, where prysm's is
+        milliseconds. Neither number is hidden and they should be read together.
+
+        THE OPTIMISER IS optax.lbfgs, NOT L-BFGS-B, and that is a genuine
+        deviation worth naming rather than glossing. optax ships L-BFGS with a
+        zoom line search and has no box-constrained variant; scipy's L-BFGS-B
+        with no bounds passed reduces to the same algorithm, because the only
+        thing the -B adds is a projection onto bounds that do not exist here.
+        Nothing on this board is bounded, so the two solve the same problem --
+        but they are different implementations with different line searches, and
+        a reader comparing prysm's row against dLux's is comparing those too.
+
+        The three convergence tests are scipy's own, transcribed rather than
+        approximated, so "time to converge" means the same thing on both boards:
+
+            gtol   max |g_i| <= gtol
+            ftol   (f_k - f_k+1) / max(|f_k|, |f_k+1|, 1) <= ftol
+            cap    maxiter
+
+        Without this the comparison would be silent nonsense -- optax's default
+        stopping is nothing at all, so dLux would run the full iteration cap
+        while the scipy-driven codes stopped at 22, and dLux would look slow for
+        having done four times the work.
+        """
+        import jax
+        import jax.numpy as jnp
+        import optax
+        import optax.tree_utils as otu
+        import dLux
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        r = case.retrieval
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        basis_d = jnp.asarray(basis)
+        amp = jnp.asarray(aperture_mask(case, self.grid_centering))
+        wavelength = case.wavelength_m
+
+        # psf_pixel_scale is angular, in arcsec: one case sample is
+        # (lambda/D)/q radians. diameter is the ARRAY extent, not the aperture's.
+        pixel_scale = np.degrees(
+            case.wavelength_m / case.pupil.diameter_m / case.q) * 3600.0
+        optics = dLux.AngularOpticalSystem(
+            wf_npixels=case.n_pupil,
+            diameter=case.pupil.diameter_m * case.n_pupil / case.n_across,
+            layers=[("pupil", dLux.Optic(transmission=amp,
+                                         opd=jnp.zeros_like(amp)))],
+            psf_npixels=case.n_focus,
+            psf_pixel_scale=pixel_scale,
+            oversample=1,
+        )
+
+        def psf(theta):
+            # zodiax's .set returns a new pytree with one leaf replaced, which
+            # is how a dLux model is updated inside a differentiated function --
+            # rebuilding the OpticalSystem per call would trace its constructor
+            # instead.
+            opd = jnp.tensordot(theta, basis_d, axes=(0, 0)) * wavelength
+            return optics.set("pupil.opd", opd).propagate_mono(wavelength)
+
+        observed = jax.block_until_ready(psf(jnp.asarray(theta_true)))
+        s = loss_scale(np.asarray(observed))
+
+        def loss(theta):
+            return jnp.mean(((psf(theta) - observed) / s) ** 2)
+
+        opt = optax.lbfgs(memory_size=r.history_size)
+        value_and_grad = optax.value_and_grad_from_state(loss)
+        ftol, gtol, maxiter = r.ftol, r.gtol, r.max_iterations
+
+        def retrieve(theta0):
+            def cond(carry):
+                _, _, _, i, _, stop = carry
+                return jnp.logical_and(i < maxiter, jnp.logical_not(stop))
+
+            def body(carry):
+                params, st, prev, i, n_ls, _ = carry
+                value, grad = value_and_grad(params, state=st)
+                denom = jnp.maximum(
+                    jnp.maximum(jnp.abs(prev), jnp.abs(value)), 1.0)
+                stop = jnp.logical_or(
+                    jnp.max(jnp.abs(grad)) <= gtol,
+                    jnp.logical_and(i > 0, (prev - value) / denom <= ftol))
+                updates, st2 = opt.update(grad, st, params, value=value,
+                                          grad=grad, value_fn=loss)
+                stepped = optax.apply_updates(params, updates)
+                # Hold the point rather than take one more step once converged,
+                # so the returned coefficients are the ones the stopping test
+                # was actually satisfied at.
+                params = jnp.where(stop, params, stepped)
+                n_ls = n_ls + otu.tree_get(st2, "num_linesearch_steps")
+                return (params, st2, value, i + 1, n_ls, stop)
+
+            init = (theta0, opt.init(theta0), jnp.asarray(jnp.inf),
+                    jnp.asarray(0), jnp.asarray(0, dtype=jnp.int64),
+                    jnp.asarray(False))
+            params, _, _, n_iter, n_ls, stop = jax.lax.while_loop(cond, body, init)
+            return params, loss(params), n_iter, n_ls, stop
+
+        theta0 = jax.device_put(jnp.asarray(theta_init), self._device)
+        compiled = jax.jit(retrieve).lower(theta0).compile()
+
+        state = {"case": case, "retrieval": True, "fn": compiled, "theta0": theta0,
+                 "psf": lambda th: np.asarray(psf(jnp.asarray(th, dtype=float))),
+                 # The traceable loss, kept on the state so the gradient can be
+                 # checked against central differences directly rather than
+                 # inferred from whether the retrieval converged. A wrong
+                 # gradient still converges, only slower -- which on a timing
+                 # board is the one failure that must not go unnoticed.
+                 "loss": loss,
+                 "loss_initial": float(loss(theta0))}
+        try:
+            state["cost_analysis"] = compiled.cost_analysis()
+        except Exception as exc:                     # noqa: BLE001
+            state["cost_analysis_error"] = f"{type(exc).__name__}: {exc}"
+        return state
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(
+            result, state["loss_initial"], state["case"],
+            state["case"].n_focus ** 2,
+            forward_model="dLux AngularOpticalSystem under jax.value_and_grad",
+            n_fev_note=(
+                "derived from optax's own num_linesearch_steps counter rather "
+                "than measured directly: the loop is one compiled XLA program, so "
+                "there is no host-side call to count. One initial evaluation, one "
+                "per line-search step, and one final loss. "
+                "optax.value_and_grad_from_state reuses the value the line search "
+                "already computed, so iterations themselves add none."))
+
     def build(self, case: Case, config: Config):
         import jax
+
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
 
         if case.is_aperture:
             return self._build_aperture(case, config)
@@ -338,6 +552,23 @@ class DLuxAdapter(Adapter):
 
     def propagate(self, state):
         """propagate_mono returns the PSF (intensity), as dLux documents."""
+        if state.get("retrieval"):
+            from dragrace.retrieval import Outcome
+
+            params, loss, n_iter, n_ls, stop = state["fn"](state["theta0"])
+            n_ls = int(n_ls)
+            return Outcome(
+                theta=np.asarray(params), loss_initial=float("nan"),
+                loss_final=float(loss), n_iterations=int(n_iter),
+                # One initial evaluation, one per line-search step, one final
+                # loss. See retrieval_report for why this is derived rather
+                # than counted.
+                n_fev=n_ls + 2, n_jev=n_ls + 1, converged=bool(stop),
+                message=("converged on the case's ftol/gtol tests"
+                         if bool(stop) else
+                         "hit retrieval.max_iterations without meeting ftol or gtol"),
+                optimizer="optax.lbfgs + zoom line search, in one compiled XLA program",
+            )
         if state.get("aperture"):
             return state["fn"]()
         return state["fn"](state["wavelength"])
@@ -364,10 +595,16 @@ class DLuxAdapter(Adapter):
     def sync(self, result) -> None:
         import jax
         # Must block on every leaf: a pytree return would otherwise leave part
-        # of the computation outstanding when the clock stops.
-        jax.block_until_ready(result)
+        # of the computation outstanding when the clock stops. A retrieval has
+        # already been materialised into an Outcome of host values by
+        # propagate() -- reading n_iterations out of the device array is itself
+        # a blocking transfer, and it happens inside the clock.
+        if not hasattr(result, "theta"):
+            jax.block_until_ready(result)
 
     def to_host(self, result) -> np.ndarray:
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         return np.asarray(result)
 
     def device_memory(self):

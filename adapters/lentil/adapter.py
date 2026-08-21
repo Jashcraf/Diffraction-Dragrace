@@ -52,7 +52,13 @@ class LentilAdapter(Adapter):
         import lentil
         return {"lentil": getattr(lentil, "__version__", "unknown"), "numpy": np.__version__}
 
+    #: lentil has no adjoint and no AD backend, so the optimiser forms its own
+    #: gradient by finite differences: P+1 = 12 forward models per gradient.
+    retrieval_gradient = "numerical"
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
         if case.is_aperture:
             if config.is_gpu:
                 return Unsupported("lentil has no GPU backend")
@@ -177,9 +183,72 @@ class LentilAdapter(Adapter):
                 "spider_width_px": seg.spider_width_m * scale,
                 "spider_offset": seg.spider_angle_offset_deg}
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the Pupil, the basis, and the observed PSF.
+
+        The Pupil is built once and its `opd` swapped per call. That follows
+        this suite's hoisting contract and costs lentil nothing it would
+        otherwise avoid: `Wavefront(lambda) * pupil` still re-applies amplitude
+        and OPD to a fresh array on every evaluation, which is the per-call work
+        the module docstring above already accounts for, and propagate_dft still
+        runs in full. Rebuilding the Pupil object per call as well would measure
+        constructor overhead rather than propagation.
+
+        oversample=1, as on the forward board: the case pins the output grid,
+        and lentil's default of 2 would compute a finer one and rebin -- a
+        different and more expensive calculation than the one asked for, which
+        would then be repeated a few hundred times inside the optimisation.
+        """
+        import lentil
+        import numpy as np
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        amp = aperture_mask(case, self.grid_centering)
+        pupil = lentil.Pupil(amplitude=amp, opd=np.zeros_like(amp),
+                             pixelscale=case.dx_pupil_m,
+                             focal_length=case.output.focal_length_m,
+                             diameter=case.pupil.diameter_m)
+        wavelength = case.wavelength_m
+        pixelscale = case.dx_focus_m
+        shape = int(case.n_focus)
+
+        def psf(theta):
+            pupil.opd = np.tensordot(np.asarray(theta, dtype=float), basis,
+                                     axes=(0, 0)) * wavelength
+            w = lentil.Wavefront(wavelength) * pupil
+            out = lentil.propagate_dft(w, pixelscale=pixelscale, shape=shape,
+                                       oversample=1)
+            return np.asarray(out.intensity)
+
+        observed = psf(theta_true)
+        s = loss_scale(observed)
+
+        def loss(theta):
+            return float(np.mean(((psf(theta) - observed) / s) ** 2))
+
+        return {"case": case, "retrieval": True, "jac": False, "fun": loss,
+                "psf": psf, "theta0": theta_init, "loss_initial": loss(theta_init),
+                "lentil": lentil}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(result, state["loss_initial"], state["case"],
+                           state["case"].n_focus ** 2,
+                           forward_model="lentil.propagate_dft")
+
     def build(self, case: Case, config: Config):
         """Untimed: the Pupil plane, which is the reusable optical model."""
         import lentil
+
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
 
         if case.is_aperture:
             return self._build_aperture(case, config)
@@ -210,6 +279,11 @@ class LentilAdapter(Adapter):
         different, more expensive calculation than the one asked for.
         """
         lentil = state["lentil"]
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
+
         if state.get("aperture"):
             import numpy as np
 
@@ -235,8 +309,11 @@ class LentilAdapter(Adapter):
     def to_host(self, result) -> np.ndarray:
         """`.field` assembles lentil's internal Field list into one array.
 
-        An aperture case has already returned a plain mask.
+        An aperture case has already returned a plain mask; a retrieval returns
+        an Outcome, whose deliverable is its coefficients.
         """
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         if isinstance(result, np.ndarray):
             return result
         return np.asarray(result.field)

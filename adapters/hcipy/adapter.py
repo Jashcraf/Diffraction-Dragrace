@@ -81,7 +81,13 @@ class HCIPyAdapter(Adapter):
         import hcipy
         return {"hcipy": getattr(hcipy, "__version__", "unknown"), "numpy": np.__version__}
 
+    #: HCIPy has no adjoint and no AD backend, so the optimiser forms its own
+    #: gradient by finite differences: P+1 = 12 forward models per gradient.
+    retrieval_gradient = "numerical"
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
         if case.is_aperture:
             if case.segmented.layout != "elt":
                 return Unsupported(
@@ -176,8 +182,75 @@ class HCIPyAdapter(Adapter):
             # calls at all, which is what an inert FFT axis looks like.
         }
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the two grids, the propagator, the basis, the observed PSF.
+
+        The FraunhoferPropagator is hoisted -- it depends only on the geometry,
+        and it is what an HCIPy user builds once and reuses. Everything that
+        depends on theta is not: the OPD, the phasor, the Field and the
+        Wavefront are all constructed per evaluation, which is genuinely what
+        this API asks of a user whose wavefront changes, and it is where HCIPy's
+        per-call cost on this board lives.
+
+        Centring is HCIPy's own split convention -- interpixel in the pupil,
+        a sample on axis in the focal plane -- and the harness builds the mask,
+        the basis and the reference on the matching grids. Forcing one
+        convention on both planes costs 5.9e-3, which on this board would show
+        up as a forward-model gate failure rather than as a slightly poor
+        accuracy number.
+        """
+        import hcipy
+        import numpy as np
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        amp = aperture_mask(case, self.grid_centering).ravel()
+
+        d = case.pupil.diameter_m
+        pupil_grid = hcipy.make_pupil_grid(case.n_pupil, d * case.n_pupil / case.n_across)
+        focal_grid = hcipy.make_focal_grid(
+            q=case.q, num_airy=case.output.extent_lambda_f_d / 2.0,
+            pupil_diameter=d, focal_length=case.output.focal_length_m,
+            reference_wavelength=case.wavelength_m,
+        )
+        prop = hcipy.FraunhoferPropagator(pupil_grid, focal_grid,
+                                          case.output.focal_length_m)
+        basis_flat = basis.reshape(basis.shape[0], -1)
+        wavelength = case.wavelength_m
+        shape = focal_grid.shape
+
+        def psf(theta):
+            opd = np.tensordot(np.asarray(theta, dtype=float), basis_flat, axes=(0, 0))
+            field = hcipy.Field(amp * np.exp(2j * np.pi * opd), pupil_grid)
+            wf = hcipy.Wavefront(field, wavelength)
+            return np.asarray(prop(wf).intensity).reshape(shape)
+
+        observed = psf(theta_true)
+        s = loss_scale(observed)
+
+        def loss(theta):
+            return float(np.mean(((psf(theta) - observed) / s) ** 2))
+
+        return {"case": case, "retrieval": True, "jac": False, "fun": loss,
+                "psf": psf, "theta0": theta_init, "loss_initial": loss(theta_init)}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(result, state["loss_initial"], state["case"],
+                           state["case"].n_focus ** 2,
+                           forward_model="hcipy.FraunhoferPropagator")
+
     def build(self, case: Case, config: Config):
         import hcipy
+
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
 
         if case.is_aperture:
             # HCIPy is the only code in the suite that ships the ELT itself, and
@@ -246,12 +319,19 @@ class HCIPyAdapter(Adapter):
         return {"case": case, "prop": prop, "wf": wf, "shape": focal_grid.shape}
 
     def propagate(self, state):
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
         if state.get("aperture"):
             return state["gen"](state["grid"])
         return state["prop"](state["wf"])
 
     def to_host(self, result) -> np.ndarray:
-        # An aperture case returns a real Field, a propagation a Wavefront.
+        # An aperture case returns a real Field, a propagation a Wavefront, a
+        # retrieval an Outcome whose deliverable is its coefficients.
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         ef = np.asarray(getattr(result, "electric_field", result))
         n = int(np.sqrt(ef.size))
         return ef.reshape(n, n)

@@ -47,7 +47,19 @@ class PrysmAdapter(Adapter):
         import prysm
         return {"prysm": getattr(prysm, "__version__", "unknown"), "numpy": np.__version__}
 
+    #: prysm ships a reverse-mode API -- sum_of_2d_modes_adjoint and
+    #: focus_dft_adjoint -- so the forward model returns (loss, dloss/dtheta)
+    #: and the optimiser never forms a difference quotient.
+    retrieval_gradient = "analytic"
+
+    #: The whole differentiated chain is prysm's backend shim, so pointing
+    #: mathops.np at CuPy moves it to the device without touching this adapter.
+    retrieval_devices = ("cpu", "gpu")
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            sup = self.retrieval_support(case, config)
+            return sup if not sup else self.supports_gradient()
         if case.is_aperture:
             if config.is_gpu:
                 return Unsupported("GPU config requires CuPy (env dragrace-gpu-cupy)")
@@ -227,7 +239,146 @@ class PrysmAdapter(Adapter):
                 "spider_count": seg.spider_count,
                 "spider_offset": seg.spider_angle_offset_deg}
 
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the executor, the basis, the mask, and the observed PSF.
+
+        The differentiated chain is prysm's own, called forwards and then
+        backwards. Every step has a prysm partner except the two that are pure
+        arithmetic -- the phasor and |.|^2 -- which are written out here, the
+        same division the gradient board makes:
+
+            phs  = sum_of_2d_modes(basis, theta)   <-> sum_of_2d_modes_adjoint
+            W    = amp * exp(2i.pi.phs)            <-> phsbar = -4.pi.Im(conj(Wbar).W)
+            E    = focus_dft(W, executor)          <-> focus_dft_adjoint
+            I    = |E|^2                           <-> Ebar = Ibar.E
+            L    = mean(((I - I_obs)/s)^2)         <-> Ibar = 2.resid/(n.s)
+
+        WHICH WIRTINGER CONVENTION THIS CHAIN IS IN, because there are two and
+        mixing them is silent. For a real loss of a complex variable both of
+        these are self-consistent, and they are complex conjugates of each other:
+
+            holomorphic   track dL/dz   -> a linear map backpropagates as A^T
+            conjugate     track dL/dz*  -> the same map backpropagates as A^H
+
+        prysm's API is the second: executor.adjoint applies the conjugate
+        transpose (fttools.MDFT.adjoint: `Ey.conj().T @ grad @ Ex.conj()`),
+        which is the true Wirtinger adjoint dL/dW* = A^H(dL/dE*). So it must be
+        handed dL/dE* = Ibar.E -- with E, not conj(E), since I = E.conj(E) gives
+        dI/dE* = E -- and the conjugation taken at the phasor step instead.
+        `adapters/numpy_baseline` is in the first convention throughout: it
+        forms dL/dE = Ibar.conj(E) and uses a plain transpose. NEITHER IS
+        WRONG. Measured on this case, the two chains agree with central
+        differences at 4.43e-8 apiece, their intermediate cotangents are exact
+        conjugates of one another, and their parameter gradients are
+        bit-identical.
+
+        What is wrong is crossing the seam. An earlier version of this method
+        took numpy_baseline's Ebar and handed it to prysm's A^H, which
+        conjugates twice: that gradient is off by up to 68x per component. It
+        does not raise, and because L-BFGS-B partly absorbs a bad gradient into
+        its step length the symptom is not an error but a STALL -- 1 iteration
+        and 44 function evaluations, a line search failing over and over --
+        which on a timing board would have read as "prysm is slow".
+        docs/gradient_board.md already states the rule this broke: the
+        intermediate complex cotangents differ between codes by a conjugation,
+        so never transcribe an intermediate from one code's chain into
+        another's. The finite-difference check in tests/test_retrieval.py is
+        what pins it.
+
+        The 1/s from the loss normalisation appears twice in Ibar: once for the
+        residual and once for the intensity that residual is differentiated
+        against. Dropping one gives a gradient wrong by a constant factor, which
+        L-BFGS-B partly absorbs into its step length -- so it still converges,
+        just more slowly, and the board would report prysm as needing more
+        iterations than it does. That failure is invisible without a
+        finite-difference check, which is why one is in tests/.
+
+        No tape and no tracing: the adapter chooses explicitly which forward
+        intermediates to keep (W and E), so the memory is minimal and
+        predictable, unlike an XLA-decided one. Expected primitive count is 2
+        forward GEMMs and 2 adjoint GEMMs per evaluation; 6 would mean the chain
+        is wrong and would unfairly penalise prysm.
+        """
+        from prysm.propagation import focus_dft, prepare_executor
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        # WHERE THE HOST/DEVICE BOUNDARY IS, on the GPU configs. L-BFGS-B is
+        # scipy's and runs on the host, so theta arrives as a host array and the
+        # (loss, gradient) pair has to go back as host scalars -- 11 doubles up,
+        # 1 + 11 doubles down, per evaluation. That transfer is charged: it is
+        # what a GPU retrieval driven by scipy actually costs, and hiding it
+        # would price a loop nobody can run. Everything between those two points
+        # -- the basis, the mask, the observed PSF, the phasor, both DFTs --
+        # stays on the device, so the O(N^2) arrays never cross.
+        xp = np
+        if self._gpu:
+            import cupy as xp                                        # noqa: N813
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        basis = xp.asarray(basis)
+        amp = xp.asarray(aperture_mask(case, self.grid_centering))
+        executor = prepare_executor(
+            pupil_dx=case.dx_pupil_m * 1e3,          # m -> mm
+            pupil_samples=case.n_pupil,
+            focal_dx=case.dx_focus_m * 1e6,          # m -> um
+            focal_samples=case.n_focus,
+            wavelength=case.wavelength_m * 1e6,      # m -> um
+            efl=case.output.focal_length_m * 1e3,    # m -> mm
+            kind="mdft",
+        )
+
+        def field(theta):
+            from prysm.polynomials import sum_of_2d_modes
+            phs = sum_of_2d_modes(basis, xp.asarray(theta, dtype=float))
+            w = amp * xp.exp(2j * xp.pi * phs)
+            return w, focus_dft(w, executor)
+
+        observed = xp.abs(field(theta_true)[1]) ** 2
+        s = float(loss_scale(self._host(observed)))
+
+        def loss_and_grad(theta):
+            from prysm.polynomials import sum_of_2d_modes_adjoint
+            from prysm.propagation import focus_dft_adjoint
+
+            w, e = field(theta)
+            resid = (xp.abs(e) ** 2 - observed) / s
+            ibar = 2.0 * resid / (resid.size * s)
+            ebar = ibar * e                          # dL/dE*, since dI/dE* = E
+            wbar = focus_dft_adjoint(ebar, executor)  # prysm applies A^H
+            phsbar = -4.0 * xp.pi * xp.imag(xp.conj(wbar) * w)
+            grad = sum_of_2d_modes_adjoint(basis, phsbar)
+            # float() and _host() are each a device sync. They are also the only
+            # two the loop needs, and they are unavoidable: scipy cannot test a
+            # device scalar for convergence.
+            return float(xp.mean(resid ** 2)), self._host(xp.real(grad))
+
+        return {"case": case, "retrieval": True, "jac": True, "fun": loss_and_grad,
+                "psf": lambda th: self._host(xp.abs(field(th)[1]) ** 2),
+                "theta0": theta_init,
+                "loss_initial": loss_and_grad(theta_init)[0]}
+
+    @staticmethod
+    def _host(a):
+        """Device array -> host NumPy, and a no-op on CPU."""
+        return np.asarray(a.get() if hasattr(a, "get") else a)
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return np.asarray(state["psf"](theta))
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(
+            result, state["loss_initial"], state["case"],
+            state["case"].n_focus ** 2,
+            forward_model="prysm focus_dft + focus_dft_adjoint (hand-written adjoint)")
+
     def build(self, case: Case, config: Config):
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
+
         if case.is_aperture:
             return self._build_aperture(case, config)
 
@@ -293,6 +444,11 @@ class PrysmAdapter(Adapter):
 
     def propagate(self, state):
         """Wavefront methods, which is how prysm documents propagation."""
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
+
         if state.get("aperture"):
             from prysm.geometry import spider
             from prysm.segmented import CompositeHexagonalAperture
@@ -337,7 +493,10 @@ class PrysmAdapter(Adapter):
     def to_host(self, result) -> np.ndarray:
         # focus_dft returns a Wavefront; the FFT path has already cropped to a
         # bare array. Both carry the complex field, so no separate
-        # complex_field() override is needed.
+        # complex_field() override is needed. A retrieval returns an Outcome,
+        # whose deliverable is its coefficients.
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         arr = result.data if hasattr(result, "data") else result
         if self._gpu:
             import cupy as cp
@@ -418,10 +577,18 @@ class PrysmAdapter(Adapter):
         loss = float(xp.mean(resid ** 2))
 
         # ---- reverse -------------------------------------------------------
+        # prysm's executor.adjoint is the conjugate transpose, so this chain is
+        # in the dL/dz* convention: it must be handed dL/dE* = Ibar*E -- with E,
+        # because I = E.conj(E) gives dI/dE* = E -- and the conjugation taken at
+        # the phasor step. numpy_baseline is in the dL/dz convention instead,
+        # pre-conjugating into Ebar and using a plain transpose. Both are
+        # correct and agree bit-for-bit on the parameter gradient; crossing the
+        # seam conjugates twice, for a gradient wrong by up to 68x per
+        # component. See _build_retrieval for the measurement.
         ibar = 2.0 * resid / resid.size
-        ebar = ibar * xp.conj(e)                    # dL/dE* for I = |E|^2
-        wbar = focus_dft_adjoint(ebar, executor)    # adjoint of the MDFT
-        phsbar = -4.0 * xp.pi * xp.imag(wbar * w)   # W = amp*exp(2i.pi.phs)
+        ebar = ibar * e                             # dL/dE*, since dI/dE* = E
+        wbar = focus_dft_adjoint(ebar, executor)    # A^H, the MDFT's adjoint
+        phsbar = -4.0 * xp.pi * xp.imag(xp.conj(wbar) * w)   # W = amp*exp(2i.pi.phs)
         grad = sum_of_2d_modes_adjoint(basis, phsbar)
         return loss, xp.asarray(grad).real
 

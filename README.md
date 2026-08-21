@@ -300,6 +300,51 @@ hand-written adjoint for this physics?** Gated against central differences at
 catches a uniform factor of 2, the classic Wirtinger slip, that a loose
 per-component tolerance would let through.
 
+### The phase-retrieval board
+
+Nonlinear-optimisation phase retrieval after Jurling & Fienup (2014): recover 11
+Zernike coefficients from one PSF with L-BFGS-B, and time the **whole
+retrieval** rather than one propagation — see
+[docs/phase_retrieval_board.md](docs/phase_retrieval_board.md).
+
+Two cases, identical in every value except where the gradient comes from:
+
+- `pr_zernike11_numeric_scan` — POPPY, lentil, PROPER, HCIPy. scipy forms the
+  gradient by finite differences: `P+1 = 12` forward models each.
+- `pr_zernike11_analytic_scan` — prysm's own adjoint API, and dLux through
+  `jax.value_and_grad` with `optax.lbfgs`, the whole optimisation compiled into
+  one XLA program. `O(1)` forward models per gradient.
+
+The optical system is a circular aperture, a 30% secondary obscuration and two
+half-ray spider vanes at ±30°. The vanes are load-bearing: without them the pupil
+is centro-symmetric, `φ(x)` and `−φ(−x)` give the identical PSF, and the
+retrieval converges cleanly onto the **twin** of the truth.
+
+**dLux was never single-threaded.** XLA honours none of the `*_NUM_THREADS`
+variables, and the `XLA_FLAGS` the config emitted was inert — one half governed
+an Eigen path the thunk runtime replaced, the other was not an XLA flag at all
+and survived only because a missing `--` made it a discarded positional. Measured
+by process CPU time, dLux used ~10 cores on every board here labelled
+`threads=1`, while every NumPy-backed adapter really did use one. On this board
+it reversed the result at every size: at N=1024 dLux beat prysm 877 ms to 1353 ms
+unpinned, and **lost 1989 ms to 1481 ms** with both held to one core. The threads axis is now enforced
+by CPU affinity in the worker — a property of the process that no library can opt
+out of — and every timed region records the core count it actually used, so
+`dragrace report` flags a row that exceeded its request rather than publishing
+it. See [docs/methodology.md](docs/methodology.md).
+
+Two further findings. POPPY carries the opposite OPD sign convention — its PSF at
+`+θ` matches the reference at `−θ` to 3.4e−16 — which the forward board never
+noticed because `validate.compare` conjugates the difference away. And the prysm
+*adapter* crossed two Wirtinger conventions: prysm's `executor.adjoint` is the
+conjugate transpose while `numpy_baseline` tracks the holomorphic cotangent, and
+both are correct — they agree with central differences at 4.43e−8 apiece and give
+bit-identical parameter gradients — but transcribing an intermediate from one
+into the other conjugates twice, for a gradient wrong by up to 68× per component.
+It does not raise and fails no gate; it just makes L-BFGS-B stall, which would
+have been published as "prysm is slow". Exactly the confound
+[docs/gradient_board.md](docs/gradient_board.md) warns about.
+
 ---
 
 ## Status
@@ -328,6 +373,7 @@ hand-written-adjoint confound on the gradient board is real and documented.
 - [docs/conventions.md](docs/conventions.md) — grids, normalisation, phase sign
 - [docs/flop_model.md](docs/flop_model.md) — the cost model, with derivations
 - [docs/gradient_board.md](docs/gradient_board.md) — prysm vs dLux in detail
+- [docs/phase_retrieval_board.md](docs/phase_retrieval_board.md) — the retrieval boards, the twin ambiguity, and what they found
 - [docs/adding_an_adapter.md](docs/adding_an_adapter.md) — the contract
 - [docs/parsing_results.md](docs/parsing_results.md) — every field of `result.json`, and how to read it safely
 - [envs/README.md](envs/README.md) — the environment matrix and its caveats

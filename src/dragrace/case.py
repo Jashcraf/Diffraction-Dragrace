@@ -17,7 +17,7 @@ import yaml
 
 ALGORITHM_CLASSES = {"fft", "matrix_dft", "fresnel_tf", "fresnel_ir", "angular_spectrum", "czt",
                      "segmented_aperture"}
-KINDS = {"pupil_to_focus", "plane_to_plane", "gradient", "aperture"}
+KINDS = {"pupil_to_focus", "plane_to_plane", "gradient", "aperture", "phase_retrieval"}
 #: Algorithm classes that propagate between two parallel planes a
 #: distance apart, rather than pupil -> focus through a lens.
 FREE_SPACE_CLASSES = {"fresnel_tf", "fresnel_ir", "angular_spectrum"}
@@ -40,12 +40,49 @@ class Aberration:
 
 
 @dataclass(frozen=True)
+class Obstruction:
+    """A secondary obscuration and its spider vanes, for `aperture: obstructed`.
+
+    Everything is a fraction of the pupil diameter, so the geometry is scale-free
+    and a case can move D without redrawing the telescope.
+
+    SPIDER SPAN is the one genuinely ambiguous parameter, so it is named rather
+    than assumed. A vane "at +30 degrees" can mean a bar lying along that
+    diameter -- which reaches the pupil edge on BOTH sides and so puts arms at
+    +30 and +210 -- or a single half-ray running outward from the obscuration.
+    `diameter` is the default because a real strut braces its secondary on both
+    sides; `radius` is the reading under which "one vane at +30 and another at
+    -30" draws two arms rather than four. The difference is visible in the PSF
+    -- four diffraction spikes against two -- so it belongs in the case file
+    where a reader can see it, not buried in an adapter.
+
+    THE SHIPPED PHASE-RETRIEVAL CASES OVERRIDE THIS TO `radius`, and not for
+    aesthetics: a diameter-spanning bar is centro-symmetric, as are the circle
+    and the annulus, and a centro-symmetric pupil makes OPD phi(x) and -phi(-x)
+    produce the identical PSF. Single-image phase retrieval then has two equally
+    good answers and finds the wrong one. Half-ray vanes break that symmetry.
+    See dragrace.retrieval and docs/phase_retrieval_board.md.
+    """
+
+    secondary_ratio: float = 0.30          # obscuration diameter / D
+    spider_width_ratio: float = 0.01       # vane width / D
+    spider_angles_deg: tuple[float, ...] = (30.0, -30.0)
+    spider_span: str = "diameter"          # diameter | radius
+
+    @property
+    def spider_count(self) -> int:
+        return len(self.spider_angles_deg)
+
+
+@dataclass(frozen=True)
 class Pupil:
     diameter_m: float
     samples_across_diameter: int
     array_samples: int
     aperture: str = "circular"
     aberration: Aberration = field(default_factory=Aberration)
+    #: Only for `aperture: obstructed`. None everywhere else.
+    obstruction: Obstruction | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +175,81 @@ class Parameters:
 
 
 @dataclass(frozen=True)
+class Retrieval:
+    """kind=phase_retrieval: the inverse problem, and how it is to be solved.
+
+    Following Jurling & Fienup (2014), JOSA A 31(7) 1348: estimate a Zernike
+    coefficient vector by minimising the squared difference between a modelled
+    PSF and an observed one, with a quasi-Newton optimiser rather than a
+    Gerchberg-Saxton iteration.
+
+    Everything an optimiser could differ on is pinned here rather than left to
+    each adapter, because the timed quantity is "how long does the retrieval
+    take" and that is meaningless unless every code is solving the same problem
+    from the same starting point under the same stopping rule. Pinned: the truth
+    coefficients, the starting guess, the convergence tests, the iteration cap
+    and the L-BFGS history length.
+
+    `gradient` splits the board in two, and the split is the point:
+
+      numerical   the optimiser is handed a scalar loss only, and forms its own
+                  gradient by two-point finite differences at scipy's default
+                  absolute step of 1e-8 -- P+1 = 12 forward models per gradient
+                  at P=11.
+      analytic    the forward model returns (loss, dloss/dtheta), whether from a
+                  hand-written adjoint or from reverse-mode AD -- ~2-3 forward
+                  models per gradient, independent of P.
+
+    That ratio is the entire argument of the Jurling & Fienup paper, and a code
+    appears on whichever board matches the gradient it can actually supply.
+    """
+
+    basis: str = "zernike_noll"
+    count: int = 11
+    first_noll: int = 1                    # Noll 1..11 == piston .. primary spherical
+    truth_amplitude_waves_rms: float = 0.05
+    seed: int = 20260819
+    initial: str = "zeros"                 # zeros | truth_perturbed
+    #: Standard deviation of the starting guess's offset from the truth, as a
+    #: fraction of truth_amplitude_waves_rms. Only read when initial is
+    #: 'truth_perturbed'. Declared rather than hardcoded because it sets how
+    #: much optimising there is to do, and therefore how much of each point's
+    #: runtime is forward models rather than L-BFGS bookkeeping.
+    initial_perturbation: float = 0.25
+    optimizer: str = "lbfgsb"
+    gradient: str = "numerical"            # numerical | analytic
+    max_iterations: int = 100
+    #: scipy's own test: (f_k - f_k+1) / max(|f_k|, |f_k+1|, 1) <= ftol.
+    ftol: float = 1e-14
+    #: scipy's own test: max |proj g_i| <= gtol.
+    gtol: float = 1e-10
+    history_size: int = 10                 # scipy maxcor / optax memory_size
+    #: Tolerance for the untimed forward-model check: each code's own PSF at the
+    #: truth coefficients, against the harness reference, after fitting one
+    #: overall scale. Separate from accuracy.max_rel_l2, which gates the
+    #: recovered coefficients, because they are different questions -- "did this
+    #: code model the right telescope" and "did the optimiser find the right
+    #: answer" -- and a single number could not serve both. Generous enough to
+    #: admit a code that reaches the focal plane by a near-field Fresnel
+    #: propagation rather than an exact Fourier transform, which is a modelling
+    #: choice and not an error: PROPER lands at ~7.5e-5 on this suite's plain
+    #: MFT case for exactly that reason.
+    max_forward_rel_l2: float = 1.0e-3
+    #: How the PSF is scaled before the residual is squared. Each of these codes
+    #: normalises its PSF differently -- POPPY divides by the entrance flux,
+    #: prysm carries dx^2, HCIPy does neither -- so an unnormalised MSE would
+    #: differ between them by orders of magnitude and a shared ftol/gtol would
+    #: silently mean a different convergence for each. Dividing by the peak of
+    #: that code's OWN observed PSF makes the loss dimensionless, identical
+    #: across codes to model accuracy, and exactly zero at the truth.
+    loss_normalisation: str = "observed_peak"
+
+    @property
+    def noll_indices(self) -> list[int]:
+        return list(range(self.first_noll, self.first_noll + self.count))
+
+
+@dataclass(frozen=True)
 class Execution:
     warmup: int = 3
     repeats: int = 25
@@ -187,6 +299,7 @@ class Case:
     accuracy: Accuracy = field(default_factory=Accuracy)
     parameters: Parameters | None = None
     segmented: Segmented | None = None
+    retrieval: Retrieval | None = None
     scan: Scan | None = None
     loss: str = "psf_mse"
     basis_caching: str = "precomputed"   # precomputed | per_call
@@ -209,6 +322,16 @@ class Case:
     def is_aperture(self) -> bool:
         """kind=aperture: the timed work is drawing the pupil, not propagating it."""
         return self.kind == "aperture"
+
+    @property
+    def is_retrieval(self) -> bool:
+        """kind=phase_retrieval: the timed work is a whole nonlinear optimisation.
+
+        One "propagation" here is one complete L-BFGS-B run -- hundreds of
+        forward models -- so this board's times are seconds where every other
+        board's are milliseconds, and its `repeats` are correspondingly few.
+        """
+        return self.kind == "phase_retrieval"
 
     def segmented_spec(self) -> dict:
         """Layout spec for dragrace.apertures, with the case's own diameter."""
@@ -353,15 +476,21 @@ class Case:
             p.append(f"dtype {self.dtype!r} not in {sorted(DTYPES)}")
         if self.n_across > self.n_pupil:
             p.append(f"samples_across_diameter ({self.n_across}) > array_samples ({self.n_pupil})")
-        if self.pupil.aperture not in ("circular", "segmented"):
-            p.append(f"aperture {self.pupil.aperture!r} unsupported "
-                     f"(circular, or segmented for kind=aperture)")
+        if self.pupil.aperture not in ("circular", "segmented", "obstructed"):
+            p.append(f"aperture {self.pupil.aperture!r} unsupported (circular; "
+                     f"obstructed; or segmented for kind=aperture)")
         if (self.pupil.aperture == "segmented") != self.is_aperture:
             p.append("aperture: 'segmented' and kind: aperture go together; the "
                      "propagation boards inject the harness's own mask and must "
                      "not be handed a shape an adapter has to draw")
+        if (self.pupil.aperture == "obstructed") != (self.pupil.obstruction is not None):
+            p.append("aperture: 'obstructed' and an `obstruction:` block go "
+                     "together -- one without the other either names a secondary "
+                     "and spiders with no geometry, or carries geometry nothing "
+                     "will draw")
         if self.kind == "gradient" and self.parameters is None:
             p.append("kind=gradient requires a `parameters:` block")
+        p += self._retrieval_problems()
         if self.is_aperture:
             if self.segmented is None:
                 p.append("kind=aperture requires a `segmented:` block")
@@ -421,6 +550,78 @@ class Case:
         if p:
             raise ValueError(f"case {self.id!r} invalid:\n  - " + "\n  - ".join(p))
 
+    def _retrieval_problems(self) -> list[str]:
+        """Validation for kind=phase_retrieval, kept together so a malformed
+        inverse problem fails at load rather than after an hour of optimising."""
+        if not self.is_retrieval:
+            return ["a `retrieval:` block is only meaningful for kind=phase_retrieval"] \
+                if self.retrieval is not None else []
+        if self.retrieval is None:
+            return ["kind=phase_retrieval requires a `retrieval:` block"]
+
+        r, p = self.retrieval, []
+        if self.pupil.aperture != "obstructed":
+            p.append(
+                f"kind=phase_retrieval pins an obstructed pupil (circular aperture, "
+                f"secondary obscuration, spider vanes), got "
+                f"aperture={self.pupil.aperture!r}. The obscuration and the vanes are "
+                f"not decoration: they break the pupil's continuous symmetries and "
+                f"are what makes the retrieval well posed at all."
+            )
+        if self.accuracy.reference != "internal_phase_retrieval":
+            p.append(
+                f"kind=phase_retrieval must gate against 'internal_phase_retrieval'; "
+                f"{self.accuracy.reference!r} compares focal fields and has no meaning "
+                f"for a recovered coefficient vector"
+            )
+        if r.basis != "zernike_noll":
+            p.append(f"unsupported retrieval basis {r.basis!r}")
+        if r.gradient not in ("numerical", "analytic"):
+            p.append(f"retrieval.gradient {r.gradient!r} not in ('numerical', 'analytic')")
+        if r.optimizer != "lbfgsb":
+            p.append(f"unsupported retrieval optimizer {r.optimizer!r}")
+        if r.initial not in ("zeros", "truth_perturbed"):
+            p.append(f"retrieval.initial {r.initial!r} not in ('zeros', 'truth_perturbed')")
+        if r.initial == "truth_perturbed" and not r.initial_perturbation > 0.0:
+            p.append(f"retrieval.initial_perturbation must be > 0 for a perturbed "
+                     f"start, got {r.initial_perturbation}")
+        if r.loss_normalisation != "observed_peak":
+            p.append(f"unsupported retrieval loss_normalisation {r.loss_normalisation!r}")
+        if r.count < 1:
+            p.append(f"retrieval.count must be >= 1, got {r.count}")
+        if r.first_noll < 1:
+            p.append(f"retrieval.first_noll must be >= 1 (Noll indices start at piston)")
+        if r.max_iterations < 1:
+            p.append(f"retrieval.max_iterations must be >= 1, got {r.max_iterations}")
+        if r.history_size < 1:
+            p.append(f"retrieval.history_size must be >= 1, got {r.history_size}")
+
+        ob = self.pupil.obstruction
+        if ob is not None:
+            if not 0.0 <= ob.secondary_ratio < 1.0:
+                p.append(f"secondary_ratio must be in [0, 1), got {ob.secondary_ratio}")
+            if not 0.0 <= ob.spider_width_ratio < 1.0:
+                p.append(f"spider_width_ratio must be in [0, 1), got "
+                         f"{ob.spider_width_ratio}")
+            if ob.spider_span not in ("diameter", "radius"):
+                p.append(f"spider_span {ob.spider_span!r} not in ('diameter', 'radius')")
+        # The truth aberration is applied through the retrieval block, so a
+        # static one on top of it would be an aberration nothing is solving for
+        # and would quietly bias every code's answer by the same unknown amount.
+        if self.pupil.aberration.coefficients:
+            p.append(
+                "kind=phase_retrieval draws its wavefront error from the `retrieval:` "
+                "block, so `pupil.aberration` must be empty -- a static OPD on top of "
+                "the truth coefficients is an aberration no adapter is solving for"
+            )
+        if self.dtype != "complex128":
+            p.append(
+                f"kind=phase_retrieval needs complex128, got {self.dtype!r}: a "
+                f"finite-difference gradient at single precision is dominated by "
+                f"roundoff, and the numerical board would be measuring noise"
+            )
+        return p
+
     def _scan_problems(self) -> list[str]:
         """Scan validation, kept here so a malformed axis fails at load.
 
@@ -469,12 +670,19 @@ class Case:
         pup = dict(d.pop("pupil"))
         ab = pup.pop("aberration", None) or {}
         coeffs = {int(k): float(v) for k, v in (ab.get("coefficients") or {}).items()}
+        obs = pup.pop("obstruction", None)
+        if obs is not None:
+            obs = dict(obs)
+            obs["spider_angles_deg"] = tuple(
+                float(a) for a in (obs.get("spider_angles_deg") or ()))
+            obs = Obstruction(**obs)
         pupil = Pupil(
             diameter_m=float(pup["diameter_m"]),
             samples_across_diameter=int(pup["samples_across_diameter"]),
             array_samples=int(pup["array_samples"]),
             aperture=pup.get("aperture", "circular"),
             aberration=Aberration(ab.get("convention", "noll_rms_waves"), coeffs),
+            obstruction=obs,
         )
         out = d.pop("output", None)
         out = Output(**{k: float(v) for k, v in out.items()}) if out else None
@@ -482,6 +690,7 @@ class Case:
         prop = Propagation(**{k: float(v) for k, v in prop.items()}) if prop else None
         params = d.pop("parameters", None)
         seg = d.pop("segmented", None)
+        retr = d.pop("retrieval", None)
         scan = d.pop("scan", None)
         if scan is not None:
             scan = dict(scan)
@@ -494,6 +703,7 @@ class Case:
             accuracy=Accuracy(**(d.pop("accuracy", None) or {})),
             parameters=Parameters(**params) if params else None,
             segmented=Segmented(**seg) if seg else None,
+            retrieval=Retrieval(**retr) if retr else None,
             scan=Scan(**scan) if scan is not None else None,
             **d,
         )
@@ -509,6 +719,21 @@ class Case:
         return case
 
     def summary(self) -> str:
+        if self.is_retrieval:
+            scan = ""
+            if self.is_scan:
+                scan = " scan " + self.scan.parameter + "=[" + ",".join(
+                    str(v) for v in sorted(self.scan.values)) + "]"
+            ob = self.pupil.obstruction
+            return (
+                f"{self.id}: {self.kind}/{self.retrieval.gradient}-gradient{scan} "
+                f"N_p={self.n_pupil} N_f={self.n_focus} "
+                f"P={self.retrieval.count} (Noll {self.retrieval.first_noll}"
+                f"-{self.retrieval.first_noll + self.retrieval.count - 1}) "
+                f"eps={ob.secondary_ratio:g} "
+                f"vanes={len(ob.spider_angles_deg)}@"
+                f"{','.join(f'{a:+g}' for a in ob.spider_angles_deg)}deg"
+            )
         if self.is_aperture:
             scan = ""
             if self.is_scan:

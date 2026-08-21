@@ -69,6 +69,34 @@ render and phasor are timed, because they are part of the differentiated chain,
 and how each framework handles them (cached, rematerialised, fused) is part of
 what the board measures.
 
+**Phase-retrieval board (`kind: phase_retrieval`).** One timed iteration is a
+whole L-BFGS-B retrieval — hundreds of forward models — so its numbers are
+seconds where every other board's are milliseconds. The hoisting rule applies
+inside the forward model exactly as above: POPPY's `OpticalSystem`, HCIPy's
+`FraunhoferPropagator`, prysm's executor and lentil's `Pupil` are all built once,
+and PROPER hoists nothing because it executes a prescription end to end against
+module-level global state. Everything downstream of the OPD array is charged per
+evaluation.
+
+Two things are pinned here that are not pinned elsewhere, and both are needed for
+the *optimisations* to be comparable rather than merely the propagations:
+
+- **The Zernike basis**, for the same reason the aperture is pinned everywhere
+  else. All six codes ship Zernikes and all six normalise differently; if each
+  rendered its own, `theta` would mean a different wavefront in each and the six
+  optimisers would be descending six different landscapes.
+- **The stopping rule.** `retrieval.minimise` applies the case's `ftol`, `gtol`,
+  iteration cap and history length, and the dLux adapter transcribes scipy's
+  three tests into its optax loop rather than approximating them. Two codes that
+  stopped on different criteria are not a comparison, and the failure is silent:
+  both runs look fine and one simply did less work.
+
+Report `n_fev` alongside the time. Wall time there is
+`(evaluations) × (cost per evaluation)`, the two factors are independent, and a
+code can lose on total time while winning per evaluation — which on the numerical
+board is the finding, not a caveat. See
+[phase_retrieval_board.md](phase_retrieval_board.md).
+
 **`build()` is untimed but not unmeasured.** Grids, DFT kernels, FFT plans, JIT
 compilation and device staging happen there — anything a real user would hoist
 out of a loop. It is reported separately as `setup.build_s` and
@@ -194,17 +222,58 @@ The declaration depends on the config, not just the adapter: dLux cannot honour
 `fft=numpy`, but on `cpu_xla_1t` the config and the adapter agree and only
 `blas`/`threads` remain inapplicable.
 
-### Why `threads` is in that list
+### `threads` was in that list, and the reason given was wrong
 
-`threads` is declared for a different reason from `fft` and `blas`. XLA *does*
-have a thread pool, but threadpoolctl cannot see it — it reports NumPy's idle
-OpenBLAS sitting in the same process, which says nothing about the code being
-measured. `Config.jax_env()` emits
+This section used to argue that `threads` was undecidable for an XLA-backed row:
+threadpoolctl cannot see XLA's pool, and `Config.jax_env()`'s
 `XLA_FLAGS=--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=N`
-before the first `import jax`, but at N_p=2048 that produced 30.2 ms at 1 thread
-and 30.0 ms at 8 — indistinguishable. So the harness cannot currently prove the
-thread count either way for an XLA-backed row, and says so rather than letting a
-false reading stand in as evidence.
+produced 30.2 ms at 1 thread against 30.0 ms at 8 — indistinguishable, so the
+harness "cannot prove the thread count either way".
+
+The timings were indistinguishable because **the knobs did nothing and XLA used
+every core at both settings**. Measured directly, as process CPU time over the
+timed region divided by elapsed wall time — dLux, jaxlib 0.10.2, N_p=1024:
+
+| `XLA_FLAGS` | cores used |
+|---|---|
+| unset | 10.06 |
+| `--xla_cpu_multi_thread_eigen=false` | 10.04 |
+| `--xla_cpu_use_thunk_runtime=false --xla_cpu_multi_thread_eigen=false` | 10.05 |
+| the full string the config emitted | 9.92 |
+| **`taskset -c 0`** | **1.00** |
+
+`--xla_cpu_multi_thread_eigen` governs the Eigen path the thunk runtime
+replaced. `intra_op_parallelism_threads` is not an XLA flag at all — it is a
+TensorFlow session option, and it never crashed the worker only because it
+lacked the `--` prefix and was discarded as a positional; adding the prefix
+aborts the process with *"Unknown flag in XLA_FLAGS"*. The string was one
+plausible-looking cleanup away from taking every JAX run down.
+
+So dLux ran on ~10 cores on every board in this repo labelled `threads=1`, while
+every NumPy-backed adapter really was held to one (measured cpu/wall = 1.00 for
+prysm, lentil, HCIPy, POPPY and the baseline, which honour `OMP_NUM_THREADS` and
+friends). On the phase-retrieval board that reversed the result: dLux beat prysm
+877 ms to 1353 ms unpinned, and **lost 2117 ms to 1737 ms** once both were held
+to one core.
+
+**Two changes, and the second matters more than the first.**
+
+1. `dragrace.worker._pin_cpus` sets CPU affinity to the requested core count
+   before any import. Affinity is a property of the *process*, so no library can
+   opt out of it, it needs no per-adapter knob, and it constrains anything that
+   sizes a pool from the core count. `threads` is therefore a real axis for
+   every adapter, dLux included, and the declaration has been removed from that
+   adapter.
+2. `metrics.Timing` records `cpu_seconds` and `cpu_wall_ratio` for every timed
+   region, and `dragrace report` prints a **THREAD REQUEST NOT HONOURED** block
+   for any row that used more than 1.5× the cores it asked for.
+
+The general lesson, which is why this is written out rather than quietly fixed:
+*"the knob made no difference"* and *"the knob does nothing"* produce identical
+evidence, and only one of them means the axis is inert. Declaring an axis
+unverifiable is a reasonable thing to do — but it decays into a false label the
+moment the underlying behaviour is assumed rather than measured. The realised
+core count is now measured on every run for exactly that reason.
 
 ## The XLA board
 
@@ -278,6 +347,35 @@ configured adapter and written to one file, so the curve's slope is comparable
 even where its absolute values are not. Read the slope against the ideal-FLOP
 scaling `dragrace plot` draws alongside it; a code flatter than ideal at small N
 is paying fixed per-call overhead, not running efficiently.
+
+**Result provenance is not homogeneous.** `best_points()` keeps the fastest
+median per (machine, case, config, adapter, size) across run ids, which is the
+right estimator for noise but is *wrong* across a harness change: after CPU
+affinity pinning was added, dLux's unpinned rows were faster than its pinned
+ones and would have won every point. Those results were pruned by hand. The
+remaining hazard is subtler — most adapters' rows predate the pin and carry
+`cpu_wall_ratio = null`, so they are almost certainly single-core (they honour
+`OMP_NUM_THREADS`, and every re-measurement has come back 0.96–1.00) but are
+not *verified* single-core. Re-measurement moved hcipy by +22% at the smallest
+size and a few percent at the larger ones. Before publishing a figure, check
+the `cores` column: a board mixing measured and unknown core counts should say
+so. **When a harness change alters what a measurement means, old results do not
+become wrong — they become incomparable, which is harder to see.**
+
+**A conjugation convention is not a bug.** Two self-consistent Wirtinger
+conventions exist for a real loss of a complex variable — track `dL/dz` and
+backpropagate a linear map as `Aᵀ`, or track `dL/dz*` and use `A^H` — and they
+are complex conjugates of each other. prysm's adjoint API is the second,
+`adapters/numpy_baseline` is the first; measured against central differences
+they agree at 4.4e-8 apiece and their parameter gradients are bit-identical.
+What breaks is *crossing* the seam: transcribing one code's intermediate
+cotangent into another's chain conjugates twice and produces a gradient off by
+up to 68×. It does not raise. L-BFGS-B absorbs part of a bad gradient into its
+step length, so the symptom is a stall — 1 iteration, 44 function evaluations —
+which on a timing board reads as "this library is slow". The general rule: when
+a third-party library disagrees with your reference, suspect the seam and the
+reference before the library, and settle it with a finite-difference check
+rather than by reading the code.
 
 **The ledger under-counts GEMMs.** `A @ B` between plain ndarrays calls
 `ndarray.__matmul__` in C and does not route through `np.matmul`, so it is
