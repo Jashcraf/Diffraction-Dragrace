@@ -61,7 +61,24 @@ class PoppyAdapter(Adapter):
         return {"poppy": getattr(poppy, "__version__", "unknown"),
                 "astropy": astropy.__version__, "numpy": np.__version__}
 
+    #: POPPY has no adjoint and no AD backend, so the optimiser forms its own
+    #: gradient by finite differences: P+1 = 12 calc_psf calls per gradient.
+    retrieval_gradient = "numerical"
+
+    #: POPPY's own device switch is poppy.conf.use_cuda, which accel_math reads
+    #: for every FFT and every elementwise step, so the propagation inside
+    #: calc_psf moves to the GPU without this adapter holding any device arrays
+    #: itself. What stays on the host is the OPD assembly and the loss, which is
+    #: the same host/device split scipy's optimiser forces on every code here.
+    retrieval_devices = ("cpu", "gpu")
+
     def supports(self, case: Case, config: Config) -> bool | Unsupported:
+        if case.is_retrieval:
+            return self.retrieval_support(case, config)
+        if case.is_aperture:
+            if config.is_gpu:
+                return Unsupported("GPU config requires CuPy (env dragrace-gpu-cupy)")
+            return True
         if case.algorithm_class == "angular_spectrum":
             return Unsupported(
                 "POPPY's FresnelWavefront applies the paraxial transfer function "
@@ -167,10 +184,143 @@ class PoppyAdapter(Adapter):
                 return name
         return "numpy"
 
+    def _build_aperture(self, case: Case, config: Config):
+        """MultiHexagonAperture + SecondaryObscuration, composed and sampled.
+
+        POPPY has no ELT, so the pupil is assembled from the generic segmented
+        machinery its documentation teaches, and the segment selection is made
+        by matching POPPY's own `_aper_center` values against the canonical
+        layout rather than by index -- POPPY numbers "clockwise from the segment
+        immediately above centre", prysm counts from "up", and lentil follows
+        its own hex-ring order, so one index list cannot serve all three.
+
+        The central obscuration is NOT a SecondaryObscuration disc: the ELT's is
+        a hexagonal hole formed by leaving 61 segments out, and adding a circular
+        stop on top of that would obscure segments the real telescope has.
+        SecondaryObscuration is used only for the six spiders, with a zero
+        secondary radius.
+
+        Note POPPY's own warning on MultiHexagonAperture: "becomes a bit slow for
+        nrings > 4". The ELT needs 17, and that is a finding rather than a
+        misuse -- it is the documented way to build this pupil in POPPY.
+        """
+        import numpy as np
+        import astropy.units as u
+        import poppy
+        from dragrace.apertures import elt_segment_centres, select_for_centres
+
+        seg = case.segmented
+        f2f = seg.segment_flat_to_flat_m
+        probe = poppy.MultiHexagonAperture(
+            rings=seg.rings, flattoflat=f2f * u.m, gap=seg.segment_gap_m * u.m,
+            center=True)
+        n_all = probe._n_aper_inside_ring(seg.rings + 1)
+        # _aper_center documents itself as returning "y, x coords" -- reversed
+        # from every other centre convention in this comparison. Taken at face
+        # value its lattice looks rotated 30 degrees from the canonical layout
+        # (nearest-neighbour directions at 0/+-60/180 rather than +-30/+-90/+-150)
+        # and only 180 of the 798 segments match; the reversal is the whole
+        # difference, not a real disagreement about where the segments go.
+        centres = np.array([probe._aper_center(i) for i in range(n_all)],
+                           dtype=float)[:, ::-1]
+
+        canonical = elt_segment_centres(case.segmented_spec())
+        keep = select_for_centres(centres, canonical, tol=seg.segment_spacing_m * 0.25)
+        if len(keep) != seg.n_segments:
+            raise ValueError(
+                f"POPPY segment selection matched {len(keep)} of {seg.n_segments} "
+                f"canonical ELT segments -- its ring enumeration or _aper_center "
+                f"convention has moved. Failing rather than drawing the wrong "
+                f"telescope."
+            )
+        return {"case": case, "aperture": True,
+                "segmentlist": [int(i) for i in keep],
+                "rings": seg.rings, "f2f": f2f, "gap": seg.segment_gap_m,
+                "spider_count": seg.spider_count,
+                "spider_width": seg.spider_width_m,
+                "spider_offset": seg.spider_angle_offset_deg,
+                "npix": case.n_pupil, "grid_size": case.pupil.diameter_m}
+
+    def _build_retrieval(self, case: Case, config: Config):
+        """Untimed: the OpticalSystem, the basis, and the observed PSF.
+
+        WHAT IS HOISTED AND WHAT IS NOT. The OpticalSystem, its detector and the
+        pupil optic are built once here, and the forward model swaps the OPD
+        array on the pupil plane before each calc_psf. That is the contract this
+        suite applies everywhere -- everything the API permits hoisting is
+        hoisted -- and it is not generous to POPPY: calc_psf still rebuilds its
+        input wavefront and re-applies every optic on every call
+        (poppy_core.propagate_mono), which is the bulk of what POPPY costs and
+        is charged in full. Rebuilding the whole OpticalSystem per call instead
+        would measure object construction, which no user would leave in a
+        retrieval loop after seeing the first profile.
+
+        ArrayOpticalElement carries `opd` as a plain attribute and `get_opd`
+        returns it unmodified -- it is an OpticalElement, not an
+        AnalyticOpticalElement, so there is no phasor cache to go stale behind
+        the swap. That is checked by the board's own forward-model gate, which
+        would catch a POPPY that kept returning the first PSF.
+
+        The Zernike basis is the harness's rather than poppy.zernike's, for the
+        reason set out in dragrace.retrieval: theta has to mean the same
+        wavefront in all six codes or they are not solving the same problem.
+        POPPY is still charged for turning that OPD into a PSF.
+        """
+        import astropy.units as u
+        import poppy
+
+        from dragrace.grid import aperture_mask
+        from dragrace.retrieval import loss_scale, retrieval_parameters
+
+        _, theta_true, theta_init, basis = retrieval_parameters(
+            case, self.grid_centering)
+        amp = aperture_mask(case, self.grid_centering)
+        array_extent_m = case.pupil.diameter_m * case.n_pupil / case.n_across
+        pixelscale_arcsec = np.degrees(
+            case.wavelength_m / case.pupil.diameter_m / case.q) * 3600.0
+
+        pupil = poppy.ArrayOpticalElement(
+            transmission=amp, opd=np.zeros_like(amp),
+            pixelscale=(case.dx_pupil_m * u.m / u.pixel))
+        osys = poppy.OpticalSystem(npix=case.n_pupil, oversample=1,
+                                   pupil_diameter=array_extent_m * u.m)
+        osys.add_pupil(pupil)
+        osys.add_detector(pixelscale=pixelscale_arcsec, fov_pixels=case.n_focus)
+        wavelength = case.wavelength_m * u.m
+
+        def psf(theta):
+            pupil.opd = np.tensordot(np.asarray(theta, dtype=float), basis,
+                                     axes=(0, 0)) * case.wavelength_m
+            return np.asarray(osys.calc_psf(wavelength=wavelength)[0].data)
+
+        observed = psf(theta_true)
+        s = loss_scale(observed)
+
+        def loss(theta):
+            return float(np.mean(((psf(theta) - observed) / s) ** 2))
+
+        return {"case": case, "retrieval": True, "jac": False, "fun": loss,
+                "psf": psf, "theta0": theta_init, "loss_initial": loss(theta_init)}
+
+    def retrieval_psf(self, state, theta) -> np.ndarray:
+        return state["psf"](theta)
+
+    def retrieval_report(self, state, result) -> dict:
+        from dragrace.retrieval import make_report
+        return make_report(result, state["loss_initial"], state["case"],
+                           state["case"].n_focus ** 2,
+                           forward_model="poppy.OpticalSystem.calc_psf")
+
     def build(self, case: Case, config: Config):
         """Untimed: the OpticalSystem a user would build once and reuse."""
         import astropy.units as u
         import poppy
+
+        if case.is_retrieval:
+            return self._build_retrieval(case, config)
+
+        if case.is_aperture:
+            return self._build_aperture(case, config)
 
         if case.kind == "plane_to_plane":
             # FresnelWavefront arrives with its own hard aperture of radius
@@ -230,6 +380,30 @@ class PoppyAdapter(Adapter):
         out the resulting normalisation anyway (validate.compare reports it as
         scale_abs), so nothing is lost by leaving POPPY's default in place.
         """
+        if state.get("retrieval"):
+            from dragrace.retrieval import minimise
+            return minimise(state["fun"], state["theta0"], state["case"],
+                            jac=state["jac"])
+
+        if state.get("aperture"):
+            import astropy.units as u
+            import poppy
+
+            segs = poppy.MultiHexagonAperture(
+                rings=state["rings"], flattoflat=state["f2f"] * u.m,
+                gap=state["gap"] * u.m, center=True,
+                segmentlist=state["segmentlist"])
+            optics = [segs]
+            if state["spider_count"]:
+                optics.append(poppy.SecondaryObscuration(
+                    secondary_radius=0.0 * u.m,
+                    n_supports=state["spider_count"],
+                    support_width=state["spider_width"] * u.m,
+                    support_angle_offset=state["spider_offset"]))
+            compound = poppy.CompoundAnalyticOptic(opticslist=optics, name="ELT")
+            return compound.sample(npix=state["npix"],
+                                   grid_size=state["grid_size"] * u.m)
+
         if state.get("free_space"):
             poppy, u = state["poppy"], state["u"]
             wf = poppy.FresnelWavefront(
@@ -258,12 +432,22 @@ class PoppyAdapter(Adapter):
         Extension 0 is the computed (here also detector-sampled, since
         oversample=1) PSF. Timed as the device->host cost like any other
         adapter's; the accuracy gate reads complex_field() instead.
+
+        A retrieval returns an Outcome; the deliverable is its coefficients.
         """
+        if hasattr(result, "theta"):
+            return np.asarray(result.theta)
         if hasattr(result, "wavefront"):
             return np.asarray(result.wavefront)
+        if isinstance(result, np.ndarray):        # aperture board: a plain mask
+            return result
         return np.asarray(result[0].data)
 
     def complex_field(self, state, result) -> np.ndarray:
+        if state.get("aperture"):
+            # A drawn pupil is already the quantity being gated; there is no
+            # field to recover and nothing extra to pay for.
+            return self.to_host(result)
         if state.get("free_space"):
             return np.asarray(result.wavefront).astype(state["case"].dtype)
         return self._complex_field_calc_psf(state, result)

@@ -49,24 +49,53 @@ def conda_root() -> Path | None:
     return None
 
 
-def interpreter_for(config: Config, allow_fallback: bool = False) -> tuple[str | None, str]:
-    """(python executable, note). None means "skip this run"."""
-    if not config.conda_env:
+def interpreter_for(config: Config, allow_fallback: bool = False,
+                    adapter: str | None = None) -> tuple[str | None, str]:
+    """(python executable, note). None means "skip this run".
+
+    `adapter` selects among the config's per-adapter environment overrides. The
+    GPU configs need it: one config id is served by two environments, because
+    pip's CUDA JAX and conda's CuPy cannot share an interpreter.
+    """
+    env_name = config.env_for(adapter)
+    if not env_name:
         return sys.executable, "current interpreter (config names no env)"
 
     root = conda_root()
     if root is not None:
-        cand = root / "envs" / config.conda_env / "bin" / "python"
+        cand = root / "envs" / env_name / "bin" / "python"
         if cand.exists():
-            return str(cand), f"conda env {config.conda_env}"
-        if root.name == config.conda_env and (root / "bin" / "python").exists():
-            return str(root / "bin" / "python"), f"conda base ({config.conda_env})"
+            return str(cand), f"conda env {env_name}"
+        if root.name == env_name and (root / "bin" / "python").exists():
+            return str(root / "bin" / "python"), f"conda base ({env_name})"
 
     if allow_fallback:
-        return sys.executable, (f"FALLBACK: env {config.conda_env!r} not found, using the "
+        return sys.executable, (f"FALLBACK: env {env_name!r} not found, using the "
                                 f"active interpreter -- results are NOT attributable")
-    return None, (f"environment {config.conda_env!r} not found; create it with "
+    return None, (f"environment {env_name!r} not found; create it with "
                   f"`conda env create -f envs/...` (see envs/README.md)")
+
+
+def cuda_path_for(python: str) -> str | None:
+    """CUDA_PATH for a conda interpreter whose CUDA came from conda-forge.
+
+    CuPy compiles its elementwise kernels with NVRTC at first use and needs the
+    toolkit *headers* on disk to do it. conda-forge puts them under
+    `$PREFIX/targets/<arch>/`, not `$PREFIX/include`, and CuPy appends
+    `/include` to whatever CUDA_PATH says -- so pointing CUDA_PATH at the
+    prefix, which is the obvious guess, resolves to a directory that does not
+    exist and every kernel launch dies with "Failed to find CUDA headers".
+
+    This has to be set by the runner rather than by `conda activate`: workers
+    are launched as `$PREFIX/bin/python`, so an environment's activate.d hooks
+    never run. Returns None when the interpreter has no conda CUDA, leaving any
+    inherited CUDA_PATH alone.
+    """
+    prefix = Path(python).parent.parent
+    for target in sorted((prefix / "targets").glob("*")) if (prefix / "targets").is_dir() else []:
+        if (target / "include" / "cuda_runtime.h").exists():
+            return str(target)
+    return None
 
 
 def result_dir(root: Path, machine_id: str, run_id: str, spec: RunSpec) -> Path:
@@ -81,7 +110,7 @@ def run_one(spec: RunSpec, results_root: Path, run_id: str, machine_id: str,
     out = result_dir(results_root, machine_id, run_id, spec)
     out.mkdir(parents=True, exist_ok=True)
 
-    python, note = interpreter_for(spec.config, allow_fallback)
+    python, note = interpreter_for(spec.config, allow_fallback, spec.adapter)
     if python is None:
         res = {"status": "skipped", "reason": note, "case_id": spec.case.id,
                "config_id": spec.config.id, "adapter": {"name": spec.adapter},
@@ -97,6 +126,12 @@ def run_one(spec: RunSpec, results_root: Path, run_id: str, machine_id: str,
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    cuda = cuda_path_for(python)
+    if cuda:
+        # CUDA_HOME too: cuda.pathfinder warns when the two disagree, and a
+        # stale /usr/local/cuda inherited from the shell is the usual source of
+        # the disagreement.
+        env["CUDA_PATH"] = env["CUDA_HOME"] = cuda
     env.update(spec.config.full_env())
 
     # Preflight: is the harness even importable there? Without this the failure

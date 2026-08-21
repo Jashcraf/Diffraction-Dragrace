@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .report import latest_axes, scan_rows
+from .report import case_kind_for, latest_axes, scan_rows
 
 # Categorical palette, fixed order. Validated for the light surface: worst
 # adjacent CVD dE 9.1, worst adjacent normal-vision dE 19.6.
@@ -143,6 +143,94 @@ def _excluded(rows: list[dict], case: str, config: str, mode: str, machine: str,
             and (r["adapter"], r["scan_value"]) not in plotted]
 
 
+#: What one timed iteration actually was, per case kind. The generic label is
+#: not merely imprecise on these boards -- it names an operation that did not
+#: happen. A phase-retrieval iteration is a whole nonlinear optimisation,
+#: hundreds of forward models, which is also why its numbers are seconds where
+#: every other board's are milliseconds.
+_Y_LABELS = {
+    "aperture": "median aperture drawing time (ms)",
+    "phase_retrieval": "median time for one complete retrieval (ms)",
+}
+
+
+def _y_label(lines: dict[str, list[dict]], case_id: str) -> str:
+    """What the timed region measured, in the axis label.
+
+    `case_kind` is read from the results, and falls back to the case file for
+    results written before that field existed rather than mislabelling them.
+    """
+    flat = [r for pts in lines.values() for r in pts]
+    return _Y_LABELS.get(case_kind_for(flat, case_id), "median propagation time (ms)")
+
+
+#: Reason substrings -> the short phrase put on the chart. A curve that stops
+#: early is one of the most easily misread things on a scan plot: without a mark
+#: at the end of the line it looks like the code was simply not run, when in
+#: fact it was run and could not finish. Matched on the reason rather than the
+#: status because "unsupported" covers both "this library cannot do it at all"
+#: and "this library cannot do it at THIS size", which are different findings.
+_TRUNCATION_PHRASES = (
+    ("out of memory", "out of memory"),
+    ("oom", "out of memory"),
+    ("gib", "out of memory"),
+    ("memory", "out of memory"),
+    ("timeout", "timed out"),
+    ("timed out", "timed out"),
+)
+
+
+def _truncation_phrase(reason: str, status: str) -> str:
+    low = (reason or "").lower()
+    for needle, phrase in _TRUNCATION_PHRASES:
+        if needle in low:
+            return phrase
+    return {"accuracy_fail": "failed its gate"}.get(status, "no result")
+
+
+def _annotate_truncated(ax, lines: dict[str, list[dict]], rows: list[dict],
+                        case_id: str, config_id: str, mode: str, machine: str,
+                        contract: str) -> None:
+    """Mark the end of any curve that stops before the widest size on the figure.
+
+    Only curves that stop *early* are annotated, and only where there is a real
+    excluded point beyond the last one drawn -- an adapter that was simply never
+    run at the larger sizes has no result to explain and gets nothing.
+    """
+    import matplotlib.patheffects as pe          # matplotlib is an optional dep
+
+    plotted = {(a, r["scan_value"]) for a, pts in lines.items() for r in pts}
+    skipped = [r for r in _excluded(rows, case_id, config_id, mode, machine, plotted)
+               if r.get("contract") == contract]
+    if not skipped:
+        return
+    widest = max(r["scan_value"] for pts in lines.values() for r in pts)
+
+    for adapter, pts in lines.items():
+        last = max(pts, key=lambda r: r["scan_value"])
+        if last["scan_value"] >= widest:
+            continue
+        beyond = [r for r in skipped
+                  if r["adapter"] == adapter and r["scan_value"] > last["scan_value"]]
+        if not beyond:
+            continue
+        first_gone = min(beyond, key=lambda r: r["scan_value"])
+        phrase = _truncation_phrase(first_gone.get("reason") or "",
+                                    first_gone.get("status") or "")
+        colour, _ = style_for(adapter)
+        ax.annotate(
+            f"✕ {phrase} above {last['scan_value']}",
+            xy=(last["scan_value"], last["median_s"] * 1e3),
+            xytext=(6, -14), textcoords="offset points",
+            fontsize=8, color=colour, va="top", ha="left",
+            path_effects=[pe.withStroke(linewidth=2.5, foreground=SURFACE)],
+            zorder=6,
+        )
+        ax.plot([last["scan_value"]], [last["median_s"] * 1e3],
+                marker="x", ms=9, mew=2.0, color=colour, zorder=6,
+                path_effects=[pe.withStroke(linewidth=3.5, foreground=SURFACE)])
+
+
 def _ideal_reference(lines: dict[str, list[dict]]) -> tuple[list[float], list[float]] | None:
     """Ideal-FLOP scaling through the fastest code's smallest point.
 
@@ -223,7 +311,13 @@ def plot_scans(rows: list[dict], out_dir: str | Path, fmt: str = "png",
         #                        corridor rather than as a seventh series; the
         #                        codes then read against it instead of fighting
         #                        it for the same few pixels.
-        ref = _ideal_reference(lines)
+        # Suppressed on the aperture board: rasterisation has no arithmetic
+        # floor, and the line there was a memory-traffic bound anchored to a
+        # measurement -- it carried no information of its own and crossed the
+        # curves, inviting the reading that a code was beating a physics floor.
+        flat_rows = [r for pts in lines.values() for r in pts]
+        ref = (None if case_kind_for(flat_rows, case_id) == "aperture"
+               else _ideal_reference(lines))
         if ref is not None:
             ax.plot(ref[0], ref[1], color=GRID, lw=4.0, solid_capstyle="round",
                     zorder=1, label="ideal FLOP scaling")
@@ -256,6 +350,8 @@ def plot_scans(rows: list[dict], out_dir: str | Path, fmt: str = "png",
                     path_effects=[pe.Stroke(linewidth=4.0, foreground=SURFACE),
                                   pe.Normal()])
 
+        _annotate_truncated(ax, lines, rows, case_id, config_id, mode, machine,
+                            contract)
         _direct_labels(ax, lines, order)
 
         sizes = sorted({r["scan_value"] for pts in lines.values() for r in pts})
@@ -266,7 +362,7 @@ def plot_scans(rows: list[dict], out_dir: str | Path, fmt: str = "png",
         ax.set_xticklabels([str(n) for n in sizes])
         ax.minorticks_off()
 
-        ax.set_ylabel("median propagation time (ms)", fontsize=10, color=INK_SOFT)
+        ax.set_ylabel(_y_label(lines, case_id), fontsize=10, color=INK_SOFT)
         ax.set_xlabel(AXIS_LABELS.get(param, param), fontsize=10, color=INK_SOFT)
         ax.set_title(f"{case_id} — runtime vs array size", fontsize=12,
                      color=INK, loc="left", pad=12)
@@ -310,6 +406,25 @@ def plot_scans(rows: list[dict], out_dir: str | Path, fmt: str = "png",
                 caption += (f" — {', '.join(sorted(mixed))} "
                             f"{'use' if len(mixed) > 1 else 'uses'} a different engine "
                             f"from the rest; not a like-for-like backend comparison")
+        # A retrieval board can legitimately mix algorithm classes -- PROPER has
+        # no matrix-DFT path at all -- and an FFT-based code cannot choose its
+        # focal sampling, so it computes the entire plane and crops. Without
+        # this line a reader takes its curve for a slower propagator, when a
+        # large part of what separates it is that it was asked for 4096 samples
+        # and had to compute four million.
+        over = {}
+        for adapter, pts in lines.items():
+            ratios = [r["focal_computed"] / r["focal_requested"] for r in pts
+                      if r.get("focal_computed") and r.get("focal_requested")
+                      and r["focal_computed"] > r["focal_requested"]]
+            if ratios:
+                over[adapter] = max(ratios)
+        if over:
+            caption += ("\n" + "; ".join(
+                f"{a} computes {v:.0f}x the focal samples this case asks for "
+                f"(FFT sampling is set by beam/grid, so the whole plane is "
+                f"computed and cropped)" for a, v in sorted(over.items())))
+
         plotted = {(a, r["scan_value"]) for a, pts in lines.items() for r in pts}
         skipped = [r for r in _excluded(rows, case_id, config_id, mode, machine, plotted)
                    if r.get("contract") == contract]

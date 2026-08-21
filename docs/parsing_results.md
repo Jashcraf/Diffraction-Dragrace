@@ -273,6 +273,35 @@ everyone. Do not treat this `rel_l2` as an error metric to rank on.
 | `reference` | `central_differences`. |
 | `loss_adapter`, `loss_reference` | The scalar loss from each, for sanity-checking that both differentiated the same objective. |
 
+## `retrieval` and `forward_accuracy` — `kind: phase_retrieval` only
+
+On this board one timed iteration is a **whole nonlinear optimisation**, not a
+propagation, so `timing` alone is unreadable: a row is
+`(forward-model evaluations) × (cost per evaluation)` and the two factors are
+independent. Both are recorded. See
+[phase_retrieval_board.md](phase_retrieval_board.md).
+
+`accuracy` on these results is the recovered coefficient vector, not a field:
+`rel_l2` is the relative error over the **observable** modes, `metric` is
+`coefficient_relative_l2`, and `quantity` is `zernike_coefficients`.
+
+| key | notes |
+|---|---|
+| `retrieval.theta` | The recovered coefficients, length `retrieval.count`, waves RMS, Noll ordered from `first_noll`. |
+| `retrieval.n_iterations` | Optimiser iterations. |
+| `retrieval.n_fev` | **Forward-model evaluations.** On the numerical board this includes the finite-difference probes — `P+1 = 12` per gradient — which is the entire point of the board. dLux derives this from optax's line-search counter rather than measuring it (its loop is one compiled XLA program with no host-side call to count); `n_fev_note` says so on those rows. |
+| `retrieval.n_jev` | Gradient evaluations. |
+| `retrieval.loss_initial`, `loss_final`, `loss_reduction` | The loss is dimensionless and identically scaled across codes — each PSF is divided by the peak of that code's own observed PSF — so these are comparable between adapters. Exactly zero at the truth. |
+| `retrieval.converged` | Whether the optimiser met `ftol`/`gtol` rather than hitting `max_iterations`. |
+| `retrieval.seconds_per_forward_model` | `timing` median ÷ `n_fev`. The number that makes two rows comparable. |
+| `retrieval.optimizer`, `forward_model` | Free text naming what actually ran. dLux's says `optax.lbfgs`, which is L-BFGS and **not** L-BFGS-B — optax has no box-constrained variant, and nothing here is bounded. |
+| `accuracy.coefficient_rel_l2_all` | The same error **with piston included**. A PSF cannot see piston (`dL/dθ₁ ≡ 0`), so the optimiser leaves it at its starting value and the gate excludes it. |
+| `accuracy.twin_rel_l2` | Distance to the twin solution `−φ(−x)`. If this is *smaller* than `rel_l2`, the code found the other valid answer rather than computing something wrong — the failure `reason` says so explicitly. |
+| `accuracy.max_coefficient_error_waves` | Worst single observable mode, in waves. |
+| `forward_accuracy` | **Untimed** gate: this code's own PSF at the truth coefficients, against the harness reference, after fitting one overall scale. Each code fits data its *own* forward model produced, so without this a wrong pupil would converge beautifully onto its own private physics and `accuracy` would pass. Shape is a normal `Comparison` with `quantity: psf_intensity`. |
+| `forward_accuracy.opd_sign_convention` | `"+"` or `"-"`. Which way this code carries OPD into phase. **POPPY is `"-"`** — its PSF at `+θ` reproduces the reference at `−θ` to 3.4e−16. Both conventions are in use and neither is wrong; it does not affect the recovered coefficients, but it sets the sign of any wavefront read out of that code. |
+| `flops.ideal.flops` | **Always `0.0` here**, which is what suppresses the ideal line and row. The per-evaluation floor *is* derivable and appears in `flops.ideal.detail`; how many evaluations the optimiser needs is measured, not predicted. |
+
 ## `timing`
 
 | key | notes |
@@ -280,6 +309,7 @@ everyone. Do not treat this `rel_l2` as an error metric to rank on.
 | `warmup`, `repeats` | From the case's `execution` block (defaults 3 and 25). Warm-up fills FFTW wisdom, the cuFFT plan cache and the NVRTC kernel cache — real cost, but setup cost. |
 | `device_compute` | Per-repeat seconds for `propagate()` **including `sync()`**. Without the sync inside the clock, an async backend returns before any arithmetic has happened and reports a ~100× speedup that is entirely dispatch latency. |
 | `host_available` | `device_compute` + the `to_host()` copy for that repeat. Equal to `device_compute` in `gradient` mode. Device→host transfer is measured, but never conflated with compute. |
+| `cpu_seconds`, `cpu_wall_ratio` | Process CPU time (user+sys) over the timed region, and that divided by elapsed wall time — i.e. **how many cores the run actually used**. `~1.0` is single-threaded, `~k` is k cores. Present because `threads` in the config is a *request* that one backend ignored for the life of this repo: XLA honours no `*_NUM_THREADS` variable and no `XLA_FLAGS` setting reaches its pool, so dLux ran on ~10 cores on boards labelled `threads=1`. Affinity pinning now enforces the request and this verifies it. Absent on results written before the measurement existed. |
 | `traced` | `true` only under `--mode trace`. **Traced runs must be excluded from every comparison** — VizTracer's overhead is per-Python-call, so it penalises loop-heavy codes far more than vectorised ones. `report.render_text` filters on this. |
 | `unit` | Always `"s"`. |
 | `device_compute_stats`, `host_available_stats` | `{min, median, mean, p95, iqr}`, or `{}` if the sample list is empty. |

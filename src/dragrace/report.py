@@ -32,6 +32,10 @@ def _row(r: dict, blocks: dict, path: Path, scan_param: str | None = None) -> di
         "config": r.get("config_id"),
         "mode": r.get("mode"),
         "status": blocks.get("status", r.get("status")),
+        # An aperture board measures drawing, not propagation, and the figures
+        # need to know which. Absent from results written before that board
+        # existed, so readers must tolerate None.
+        "case_kind": r.get("case_kind"),
         "machine": (r.get("machine") or {}).get("id"),
         "cpu": (r.get("machine") or {}).get("cpu"),
         # Results measured under different contracts are not comparable; the
@@ -50,6 +54,11 @@ def _row(r: dict, blocks: dict, path: Path, scan_param: str | None = None) -> di
         "p95_s": stats.get("p95"),
         "iqr_s": stats.get("iqr"),
         "traced": t.get("traced", False),
+        # Cores the timed region actually used. `threads` in the config is a
+        # request; this is what happened. Absent on results written before the
+        # measurement existed, so readers must tolerate None.
+        "cpu_wall_ratio": t.get("cpu_wall_ratio"),
+        "threads_requested": (r.get("backend") or {}).get("requested", {}).get("threads"),
         "rel_l2": acc.get("rel_l2"),
         "gate": acc.get("gate"),
         "ideal_gflop": (fl.get("ideal") or {}).get("flops", 0) / 1e9 or None,
@@ -60,6 +69,22 @@ def _row(r: dict, blocks: dict, path: Path, scan_param: str | None = None) -> di
         "mem_peak_mib": ((blocks.get("memory") or {}).get("tracemalloc_peak_bytes") or 0) / 2**20
                         or None,
         "grad_gate": (blocks.get("gradient_accuracy") or {}).get("gate"),
+        # Phase-retrieval board. Wall time alone is unreadable there: a row is
+        # (forward-model evaluations x cost per evaluation) and the two factors
+        # are independent, so both travel with the timing.
+        "n_iterations": (blocks.get("retrieval") or {}).get("n_iterations"),
+        "n_fev": (blocks.get("retrieval") or {}).get("n_fev"),
+        "s_per_fev": (blocks.get("retrieval") or {}).get("seconds_per_forward_model"),
+        "loss_reduction": (blocks.get("retrieval") or {}).get("loss_reduction"),
+        # Focal samples this code evaluated, against the number the case asked
+        # for. An MFT evaluates exactly the requested grid; an FFT-based code
+        # cannot, because its focal sampling is set by beam/grid, so it computes
+        # the whole plane and crops. Carried so a mixed board says so.
+        "focal_computed": (blocks.get("retrieval") or {}).get("focal_points_computed"),
+        "focal_requested": (blocks.get("retrieval") or {}).get("focal_points_requested"),
+        "retrieval_converged": (blocks.get("retrieval") or {}).get("converged"),
+        "forward_rel_l2": (blocks.get("forward_accuracy") or {}).get("rel_l2"),
+        "opd_sign": (blocks.get("forward_accuracy") or {}).get("opd_sign_convention"),
         "reason": blocks.get("reason", r.get("reason")),
         "path": str(path),
     }
@@ -144,6 +169,29 @@ def latest_axes(rows: list[dict]) -> dict[tuple, set]:
     return {k: ax for k, (_, ax) in newest.items() if ax}
 
 
+def case_kind_for(rows: list[dict], case_id: str) -> str | None:
+    """The `kind` of a case, from the results or failing that from the case file.
+
+    Results written before the aperture board existed carry no `case_kind`, and
+    they also carry an `ideal.flops` for it that has since been withdrawn -- N^2
+    "one write per pixel", which was a memory-traffic bound presented as an
+    arithmetic floor. Rather than reprice those files or re-run hours of
+    measurement, the readers below suppress the ideal line and the ideal row for
+    aperture cases outright. The kind is the honest discriminator, so it is
+    recovered from the case file when a result predates the field.
+    """
+    for r in rows:
+        if r.get("case") == case_id and r.get("case_kind"):
+            return r["case_kind"]
+    try:
+        import yaml
+        for p in Path("cases").rglob(f"{case_id}.yaml"):
+            return (yaml.safe_load(p.read_text()) or {}).get("kind")
+    except Exception:                                  # noqa: BLE001
+        pass
+    return None
+
+
 def _case_label(r: dict) -> str:
     return r["case"] if r.get("scan_value") is None else f"{r['case']}@{r['scan_value']}"
 
@@ -186,8 +234,86 @@ def render_scans(rows: list[dict]) -> list[str]:
 
         ideal = [next((r["ideal_gflop"] for r in sel
                        if r["scan_value"] == n and r["ideal_gflop"]), None) for n in sizes]
-        if all(i for i in ideal):
+        # Never for an aperture board: drawing a pupil has no arithmetic floor,
+        # so any figure here is invented. See case_kind_for.
+        if case_kind_for(pts, case) != "aperture" and all(i for i in ideal):
             out.append(f"{'ideal GFLOP':<16}" + "".join(f"{i:>11.3f}" for i in ideal))
+    return out
+
+
+def render_retrievals(rows: list[dict]) -> list[str]:
+    """The phase-retrieval board, decomposed into its two independent factors.
+
+    Wall time on this board is (forward-model evaluations) x (cost per
+    evaluation), and a reader cannot tell those apart from the total. A code can
+    lose on time while winning per evaluation -- it needed more of them -- which
+    is a completely different finding from being slow, and on the numerical
+    board it is the finding: a finite-difference gradient costs P+1 evaluations
+    where an analytic one costs O(1).
+
+    `fwd` is the untimed forward-model check: this code's own PSF at the truth
+    coefficients against the harness reference. It is what separates "converged
+    fast" from "converged fast onto its own private physics". `s` is the OPD
+    sign convention the code was found to use, which does not affect the
+    recovered coefficients but does affect the sign of any wavefront read out of
+    it.
+    """
+    pts = [r for r in best_points(rows) if r.get("n_fev")]
+    if not pts:
+        return []
+
+    out: list[str] = []
+    keys = {(r["case"], r["config"], r.get("contract")) for r in pts}
+    for case, config, contract in sorted(keys, key=str):
+        sel = [r for r in pts if r["case"] == case and r["config"] == config
+               and r.get("contract") == contract]
+        out.append(f"\nRETRIEVAL {case} [{config}] [{contract}]")
+        out.append(f"{'adapter':<16}{'N':>6}{'total ms':>11}{'iters':>7}{'n_fev':>7}"
+                   f"{'ms/fev':>9}{'cores':>7}{'loss drop':>11}{'fwd':>10}{'s':>3}"
+                   f"{'focal x':>9}  gate")
+        out.append("-" * 103)
+        for r in sorted(sel, key=lambda r: (r["adapter"], r["scan_value"] or 0)):
+            per = f"{r['s_per_fev'] * 1e3:.3f}" if r.get("s_per_fev") else "-"
+            drop = f"{r['loss_reduction']:.1e}" if r.get("loss_reduction") else "-"
+            fwd = f"{r['forward_rel_l2']:.1e}" if r.get("forward_rel_l2") is not None else "-"
+            cores = (f"{r['cpu_wall_ratio']:.2f}"
+                     if r.get("cpu_wall_ratio") is not None else "-")
+            over = "-"
+            if r.get("focal_computed") and r.get("focal_requested"):
+                over = f"{r['focal_computed'] / r['focal_requested']:.0f}x"
+            out.append(f"{r['adapter']:<16}{r['scan_value'] or 0:>6}"
+                       f"{(r['median_s'] or 0) * 1e3:>11.1f}"
+                       f"{r.get('n_iterations') or 0:>7}{r['n_fev']:>7}{per:>9}"
+                       f"{cores:>7}{drop:>11}{fwd:>10}"
+                       f"{(r.get('opd_sign') or '?'):>3}{over:>9}"
+                       f"  {r['gate'] or '-'}")
+
+        over = {r["adapter"]: r["focal_computed"] / r["focal_requested"]
+                for r in sel if r.get("focal_computed") and r.get("focal_requested")
+                and r["focal_computed"] > r["focal_requested"]}
+        if over:
+            worst = max(over.values())
+            out.append(
+                f"  focal x: focal samples computed / asked for. "
+                f"{', '.join(sorted(over))} "
+                f"{'are' if len(over) > 1 else 'is'} FFT-based, so the focal sampling "
+                f"is set by beam/grid and the\n     whole plane must be computed and "
+                f"cropped -- up to {worst:.0f}x the samples the case pins, "
+                f"{100 * (1 - 1 / worst):.2f}% of it discarded. That is a "
+                f"CAPABILITY\n     difference from the matrix-DFT codes, which "
+                f"evaluate only the grid asked for, and it is not the same claim as "
+                f"'this propagator is slower'.")
+        signs = {r["adapter"]: r.get("opd_sign") for r in sel if r.get("opd_sign")}
+        flipped = sorted(a for a, s in signs.items() if s == "-")
+        if flipped:
+            out.append(f"  s: OPD sign convention. {', '.join(flipped)} "
+                       f"{'carry' if len(flipped) > 1 else 'carries'} "
+                       f"exp(-2i.pi.OPD/lambda), opposite to the harness and to the "
+                       f"other codes here.\n     Harmless for the retrieval -- each "
+                       f"code fits a PSF its own model produced, so both conventions "
+                       f"recover the same\n     theta -- but a wavefront read out of "
+                       f"{'these' if len(flipped) > 1 else 'this'} "
+                       f"code{'s' if len(flipped) > 1 else ''} has the opposite sign.")
     return out
 
 
@@ -226,6 +352,23 @@ def render_text(rows: list[dict]) -> str:
         # on this config, and a reader needs it before reading any of the times.
         # Union per adapter: an adapter declaring more axes in a later run must
         # not appear twice, which would read as two different adapters.
+        # A row that used more cores than it asked for is not a slow-or-fast
+        # question, it is a labelling failure: every other row on the same axis
+        # was held to the request. Surfaced per block, above the axis notes,
+        # because it invalidates comparisons rather than merely qualifying them.
+        overs: dict[str, float] = {}
+        for r in rs:
+            got, want = r.get("cpu_wall_ratio"), r.get("threads_requested")
+            if got and want and got > 1.5 * want:
+                overs[r["adapter"]] = max(overs.get(r["adapter"], 0.0), got / want)
+        if overs:
+            out.append("\nTHREAD REQUEST NOT HONOURED")
+            for adapter, factor in sorted(overs.items()):
+                out.append(f"  {adapter:<16}used {factor:.1f}x the requested cores")
+            out.append("  These rows are not comparable with the rest of their board: the "
+                       "others were held\n  to the request. Measured from process CPU time "
+                       "over the timed region, not assumed.")
+
         inert = latest_axes(rs)
         if inert:
             out.append("\nBACKEND AXES THAT DID NOT APPLY")
@@ -234,6 +377,8 @@ def render_text(rows: list[dict]) -> str:
             out.append("  These rows measure the code honestly but are not data points "
                        "along those\n  axes -- the library has no such knob, or the "
                        "harness cannot verify it.")
+
+        out += render_retrievals(rs)
 
         grad = [r for r in rs if r["mode"] == "gradient" and r["status"] == "ok"]
         if grad:

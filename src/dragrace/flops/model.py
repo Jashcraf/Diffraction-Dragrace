@@ -20,7 +20,7 @@ which is what makes the roofline classification possible.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from ..case import Case
 
@@ -93,6 +93,40 @@ def ideal_work(case: Case) -> Work:
     n_p, n_f, n_d = case.n_pupil, case.n_focus, case.n_across
     isz = itemsize(case.dtype)
 
+    # BEFORE the algorithm_class dispatch, not after. A retrieval case names
+    # matrix_dft -- that is the transform inside its forward model -- so the
+    # branch below would otherwise claim it and price a whole nonlinear
+    # optimisation as a single propagation, which is wrong by whatever factor
+    # the optimiser's evaluation count happens to be.
+    if case.is_retrieval:
+        # NO FLOP FLOOR, and flops=0 is what suppresses the ideal line on the
+        # figure and the ideal row in the table -- the same decision the
+        # segmented_aperture branch below makes, for a different reason.
+        #
+        # Here the per-evaluation floor IS derivable, and it is computed: one
+        # forward model is the basis render plus a phasor plus the MFT. What is
+        # not derivable is how many of them the optimiser will need. That
+        # depends on the line search, on the L-BFGS history and on the curvature
+        # the code happens to meet -- it is measured, not predicted, and
+        # multiplying a real per-evaluation floor by a guessed evaluation count
+        # would produce a total carrying the authority of the first and the
+        # reliability of the second.
+        #
+        # The honest version of the question that total would have answered is
+        # in the result's `retrieval` block, which records n_fev and
+        # n_iterations per point, and in the report's cost-per-evaluation
+        # column: "336 forward models at 4.1 ms each" says what happened without
+        # asserting how many should have been needed.
+        r = case.retrieval
+        per_call = (ideal_work(replace(case, kind="pupil_to_focus"))
+                    + basis_work(case, r.count))
+        return Work(
+            0.0, per_call.tops, per_call.bytes,
+            f"P={r.count} Noll modes, {r.gradient} gradient; one forward model is "
+            f"{per_call.flops / 1e6:.1f} MFLOP ({per_call.detail}), but the number "
+            f"of them is measured rather than derivable, so no total is reported"
+        )
+
     if cls in ("matrix_dft", "czt") and cls == "matrix_dft":
         # Two GEMMs: (N_f x N_p)(N_p x N_p) then (N_f x N_p)(N_p x N_f).
         flops = zgemm(n_f, n_p, n_p) + zgemm(n_f, n_p, n_f)
@@ -124,6 +158,38 @@ def ideal_work(case: Case) -> Work:
         flops = fft_2d(n) + 2 * elementwise_mul(n * n)
         tops = 2 * n * n if case.basis_caching == "per_call" else 0.0
         return Work(flops, tops, isz * 4 * n * n, f"1 fft2({n}x{n}) + 2 chirp multiplies")
+
+    if cls == "segmented_aperture":
+        # NO FLOP FLOOR, deliberately, and flops=0 is what suppresses the ideal
+        # line on the figure and the ideal row in the table.
+        #
+        # Rasterisation has no derivable arithmetic requirement, so anything put
+        # here would be invented. An earlier version used N^2 -- one write per
+        # output pixel -- and it was worse than nothing on three counts. It is a
+        # memory-traffic bound wearing the label that means "the arithmetic the
+        # physics requires" everywhere else in this suite. It carries no
+        # information of its own, because plots.py anchors the ideal line through
+        # the fastest measured point, so only its slope is content and that slope
+        # is just N^2. And it does not bound the data: HCIPy runs 36.8 ms at
+        # N=256 against 43.5 at N=512, far flatter than N^2, so the line crossed
+        # the curves and invited the reading that a code was beating a physics
+        # floor.
+        #
+        # The question that line was meant to answer -- is this code O(N^2) or
+        # steeper -- is real, and POPPY is genuinely steeper. Log-log gridlines
+        # answer it without asserting a floor that does not exist.
+        #
+        # `tops` still carries the honest per-pixel count, which is a
+        # transcendental/op tally rather than a claim about required arithmetic.
+        seg = case.segmented
+        n = case.n_pupil
+        nseg = seg.n_segments if seg else 0
+        return Work(
+            0.0, float(n * n), isz // 2 * n * n,
+            f"{nseg} segments + {seg.spider_count if seg else 0} spiders onto "
+            f"{n}x{n}; no arithmetic floor -- rasterisation is memory-bound and "
+            f"any FLOP figure here would be invented, so none is reported"
+        )
 
     if cls == "czt":
         # Bluestein: per 1-D transform, 3 FFTs of length L plus 2 elementwise

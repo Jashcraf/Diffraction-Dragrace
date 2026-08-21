@@ -1,0 +1,139 @@
+# Phase retrieval by nonlinear optimisation -- NUMERICAL-GRADIENT board.
+#
+# Jurling & Fienup (2014), JOSA A 31(7) 1348. Estimate 11 Zernike coefficients
+# by minimising the squared difference between a modelled PSF and an observed
+# one, with L-BFGS-B, and measure how long that takes as the pupil array grows.
+#
+# This is the board for codes that can supply a forward model and nothing else,
+# so the optimiser forms its own gradient by two-point finite differences:
+# POPPY, lentil, PROPER and HCIPy. At P = 11 that is 12 forward models per
+# gradient. Its sibling case pr_zernike11_analytic_scan runs the identical
+# physics for the codes that can differentiate their own forward model (prysm's
+# adjoint API, dLux through JAX), where a gradient costs O(1) forward models
+# instead of P+1. Comparing the two boards is the Jurling & Fienup argument
+# reproduced on real propagation codes; see docs/phase_retrieval_board.md.
+#
+# THE OPTICAL SYSTEM
+#   circular aperture, 30% linear secondary obscuration, and two spider vanes,
+#   one at +30 degrees and one at -30. `spider_span: radius` makes each vane a
+#   single half-ray running outward from the obscuration, so two vanes draw two
+#   arms; the alternative reading, `diameter`, lays each vane along its whole
+#   diameter and two vanes then draw a four-armed X.
+#
+#   THAT CHOICE DECIDES WHETHER THE PROBLEM IS SOLVABLE, so it is not a
+#   cosmetic default. Every other element here -- the circle, the annulus, a
+#   diameter-spanning bar -- is centro-symmetric, and a centro-symmetric pupil
+#   makes OPD phi(x) and -phi(-x) produce the identical PSF. A single in-focus
+#   image then cannot tell the two apart, and it does not: measured on the
+#   `diameter` variant, L-BFGS-B drives the loss from 1.5e-3 down to 3.2e-9 and
+#   returns the exact twin of the truth -- every mode of odd radial order
+#   sign-flipped, coefficient error 1.27. Nothing is wrong with the optimiser;
+#   the inverse problem simply has two equally good answers. A pupil with arms
+#   at +30 and -30 and nothing at +210 and -210 is not centro-symmetric, which
+#   makes the truth the unique global minimum: loss 0 there against 1.1e-6 at
+#   the twin.
+#
+#   The obscuration earns its place the same way: an unobstructed circular pupil
+#   is rotationally invariant, so its PSF cannot separate the two members of a
+#   rotated Zernike pair and the retrieval is degenerate in the astigmatism,
+#   coma and trefoil planes.
+#
+# WHY THE RETRIEVAL STARTS NEAR THE TRUTH RATHER THAN AT ZERO
+#   Breaking the symmetry is necessary and not sufficient. 1.1e-6 of separation
+#   is invisible from a cold start's 1.5e-3, so which basin the path enters is
+#   decided by details that move with the grid: measured from theta = 0, this
+#   case recovers the truth at N = 64 and 128 and lands on the twin at 256, 512
+#   and 1024. Widening the vanes until every size happened to work was tried and
+#   rejected -- 0.05 D was robust across the scan and 0.10 D broke at N = 64,
+#   which is fitting the telescope to the optimiser.
+#
+#   `initial: truth_perturbed` starts from a seeded estimate 25% away from the
+#   truth, which is both how fine phasing is actually deployed and what makes
+#   this board comparable: the iteration count then holds at 21-23 at every size
+#   and on both gradient paths, so the runtime curve isolates the cost of one
+#   forward model instead of confounding it with a wandering iteration count.
+#
+# THE WAVEFRONT ERROR
+#   Noll 1..11: piston, tip, tilt, defocus, both astigmatisms, both comas, both
+#   trefoils, primary spherical. That is what "the first 11, up to primary
+#   spherical" means on Noll ordering, and the two readings agree exactly.
+#   Piston is in the vector and is unobservable -- dL/dtheta_1 is identically
+#   zero, measured at 7.5e-20 -- so it is reported separately rather than
+#   dropped.
+#
+# TIMED REGION: one complete L-BFGS-B retrieval, from the perturbed start to
+# convergence. Not one propagation. The forward model inside it is charged for
+# everything the
+# library does per call; only the Zernike basis and the amplitude mask are
+# hoisted, and those are supplied by the harness so that `theta` means the same
+# wavefront in all six codes. Times here are seconds, so `repeats` is small.
+
+id: pr_zernike11_numeric_scan
+kind: phase_retrieval
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # A template: samples_across_diameter and array_samples are replaced at each
+  # scan point, their ratio (1 -- no guard band) held fixed.
+  diameter_m: 0.01
+  samples_across_diameter: 64
+  array_samples: 64
+  aperture: obstructed
+  obstruction:
+    secondary_ratio: 0.30        # obscuration diameter / D
+    spider_width_ratio: 0.02     # vane width / D
+    spider_angles_deg: [30.0, -30.0]
+    # radius, not diameter: this is what breaks the twin ambiguity. See above.
+    spider_span: radius
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 2.0
+  extent_lambda_f_d: 32.0        # -> N_f = 64, fixed at every scan point
+
+retrieval:
+  basis: zernike_noll
+  first_noll: 1                  # piston
+  count: 11                      # .. through primary spherical (Noll 11)
+  truth_amplitude_waves_rms: 0.05
+  seed: 20260819                 # every adapter retrieves the same wavefront
+  initial: truth_perturbed       # .. from the same starting point. See above.
+  initial_perturbation: 0.25     # sigma of the start's offset, x the amplitude
+  optimizer: lbfgsb
+  gradient: numerical            # scipy forms it by finite differences
+  max_iterations: 100
+  ftol: 1.0e-14
+  gtol: 1.0e-10
+  history_size: 10               # scipy maxcor; optax memory_size on the sibling
+  loss_normalisation: observed_peak
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil
+  values: [64, 128, 256, 512, 1024]
+
+execution:
+  # Per point. One repeat is a whole optimisation -- hundreds of forward models
+  # -- so the counts are small where the propagation boards use 25.
+  warmup: 1
+  repeats: 3
+  timeout_s: 1800.0
+
+accuracy:
+  # Gated on the recovered coefficients against the truth, over the observable
+  # modes. A code that converged to the twin solution rather than the truth
+  # scores near 2 here and fails loudly, which is correct: its runtime is not
+  # comparable with a code that found the right basin.
+  reference: internal_phase_retrieval
+  max_rel_l2: 1.0e-3
+
+notes: >
+  Runtime is the headline, but read it with n_fev from the same row: these codes
+  differ both in what one forward model costs and in how many the optimiser
+  needed, and only the product is the wall time. `dragrace report` prints the
+  retrieval table with iterations, forward-model evaluations and the achieved
+  loss reduction alongside every timing.

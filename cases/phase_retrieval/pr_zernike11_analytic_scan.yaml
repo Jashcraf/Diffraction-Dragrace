@@ -1,0 +1,98 @@
+# Phase retrieval by nonlinear optimisation -- ANALYTIC-GRADIENT board.
+#
+# The sibling of pr_zernike11_numeric_scan, and IDENTICAL to it in every value
+# except `retrieval.gradient`. tests/test_schema.py asserts that field by field,
+# because the whole point of running two cases is that the only difference
+# between them is where the gradient comes from -- if the physics drifted, the
+# comparison between the two boards would silently stop meaning anything.
+#
+# Here the forward model returns (loss, dloss/dtheta) and the optimiser never
+# forms a difference quotient:
+#
+#   prysm   a hand-written adjoint built from prysm's own reverse-mode API,
+#           sum_of_2d_modes_adjoint and focus_dft_adjoint, driven by the same
+#           scipy L-BFGS-B call the numerical board uses with jac=True.
+#   dLux    jax.value_and_grad over the dLux optical system, minimised with
+#           optax's L-BFGS. See docs/phase_retrieval_board.md on the one place
+#           this deviates from the brief: optax ships L-BFGS with a zoom line
+#           search and has no box-constrained L-BFGS-B, so the bound-projection
+#           step is absent. Nothing here is bounded, so the two are the same
+#           algorithm on this problem -- but it is a real difference in the
+#           implementation being timed and it is named rather than glossed.
+#
+# Both codes are held to the same convergence tests, iteration cap and L-BFGS
+# history length as the numerical board, so "time to converge" means the same
+# thing on both figures and they can be read against each other.
+#
+# WHAT THE PAIR OF BOARDS MEASURES. At P = 11 a two-point finite-difference
+# gradient costs 12 forward models and an analytic one costs O(1), independent
+# of P -- the Jurling & Fienup argument. Measured against this harness's own
+# reference implementation, the numerical path needs ~300 forward models to
+# converge where the analytic path needs ~30. Whether that 10x in evaluations
+# becomes 10x in wall time is what the two figures answer, and it need not:
+# an analytic gradient is more expensive per evaluation than a loss alone.
+#
+# TIMED REGION: one complete retrieval, from the perturbed start to convergence.
+
+id: pr_zernike11_analytic_scan
+kind: phase_retrieval
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  diameter_m: 0.01
+  samples_across_diameter: 64
+  array_samples: 64
+  aperture: obstructed
+  obstruction:
+    secondary_ratio: 0.30        # obscuration diameter / D
+    spider_width_ratio: 0.02     # vane width / D
+    spider_angles_deg: [30.0, -30.0]
+    # radius, not diameter: this is what breaks the twin ambiguity. The sibling
+    # case file carries the measurement behind that choice.
+    spider_span: radius
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 2.0
+  extent_lambda_f_d: 32.0        # -> N_f = 64, fixed at every scan point
+
+retrieval:
+  basis: zernike_noll
+  first_noll: 1                  # piston
+  count: 11                      # .. through primary spherical (Noll 11)
+  truth_amplitude_waves_rms: 0.05
+  seed: 20260819                 # the same wavefront as the numerical board
+  initial: truth_perturbed       # .. and the same starting point
+  initial_perturbation: 0.25
+  optimizer: lbfgsb
+  gradient: analytic             # <- the only field that differs from the sibling
+  max_iterations: 100
+  ftol: 1.0e-14
+  gtol: 1.0e-10
+  history_size: 10
+  loss_normalisation: observed_peak
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_pupil
+  values: [64, 128, 256, 512, 1024]
+
+execution:
+  warmup: 1
+  repeats: 3
+  timeout_s: 1800.0
+
+accuracy:
+  reference: internal_phase_retrieval
+  max_rel_l2: 1.0e-3
+
+notes: >
+  dLux carries an extra caveat the other codes do not: its retrieval is one
+  compiled XLA program, so the compile cost lands in setup.first_call_s and the
+  timed region is pure execution. That is the same treatment the propagation
+  boards give it, and it is why its first_call_s is seconds where prysm's is
+  milliseconds. Read the two together.

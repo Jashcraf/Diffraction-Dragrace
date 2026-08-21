@@ -82,13 +82,63 @@ def test_jax_env_sets_x64_from_the_config_precision():
     assert _config(precision_override="complex64").jax_env()["JAX_ENABLE_X64"] == "0"
 
 
-def test_jax_env_pins_xla_threads():
-    """OMP_NUM_THREADS does not reach XLA; without this a threads=1 run could
-    quietly use every core."""
-    flags = _config(threads=1).jax_env()["XLA_FLAGS"]
-    assert "--xla_cpu_multi_thread_eigen=false" in flags
-    assert "intra_op_parallelism_threads=1" in flags
-    assert "intra_op_parallelism_threads=8" in _config(threads=8).jax_env()["XLA_FLAGS"]
+def test_jax_env_does_not_pretend_to_pin_xla_threads():
+    """This test used to assert the opposite, and the assertion was false.
+
+    It required XLA_FLAGS to carry
+    `--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=N`, and
+    neither half did anything. Measured on jaxlib 0.10.2 at N_p=1024, dLux ran
+    at cpu/wall = 10.06 with no XLA_FLAGS, 10.04 with the eigen flag and 9.92
+    with the full string -- ~10 cores throughout, on a config labelled
+    threads=1. Worse, `intra_op_parallelism_threads` is not an XLA flag at all;
+    it survived only because it lacked the `--` prefix and was discarded as a
+    positional, and adding the prefix aborts the process outright.
+
+    So the config must NOT emit it, and the threads axis is enforced by CPU
+    affinity in the worker instead.
+    """
+    assert "XLA_FLAGS" not in _config(threads=1).jax_env()
+    assert "XLA_FLAGS" not in _config(threads=8).jax_env()
+    # x64 is still the config's business and still has to be an env var.
+    assert _config(threads=1).jax_env()["JAX_ENABLE_X64"] == "1"
+
+
+def test_worker_pins_cpu_affinity_to_the_requested_thread_count():
+    """The mechanism that actually enforces `threads`, since no library-level
+    knob reaches XLA. Affinity is a property of the process, so nothing can opt
+    out of it."""
+    import os
+
+    from dragrace.worker import _pin_cpus
+
+    if not hasattr(os, "sched_setaffinity"):
+        pytest.skip("no sched_setaffinity on this platform")
+
+    original = os.sched_getaffinity(0)
+    try:
+        if len(original) < 2:
+            pytest.skip("need at least 2 cores to observe a restriction")
+        _pin_cpus(_config(threads=1))
+        assert len(os.sched_getaffinity(0)) == 1
+    finally:
+        os.sched_setaffinity(0, original)
+
+
+def test_gpu_configs_are_not_pinned():
+    """The device does the work; throttling the host thread would only slow
+    dispatch."""
+    import os
+
+    from dragrace.worker import _pin_cpus
+
+    if not hasattr(os, "sched_setaffinity"):
+        pytest.skip("no sched_setaffinity on this platform")
+    original = os.sched_getaffinity(0)
+    try:
+        _pin_cpus(_config(threads=1, device="cuda:0"))
+        assert os.sched_getaffinity(0) == original
+    finally:
+        os.sched_setaffinity(0, original)
 
 
 def test_full_env_lets_a_config_override_the_defaults():
@@ -127,3 +177,70 @@ def test_latest_axes_is_keyed_by_config_too():
     axes = latest_axes(rows)
     assert axes[("dlux", "cpu_numpy_1t")] == {"fft", "blas", "threads"}
     assert axes[("dlux", "cpu_xla_1t")] == {"blas", "threads"}
+
+
+# ------------------------------------------- one config, two environments ----
+def test_gpu_config_routes_dlux_to_the_jax_environment():
+    """gpu_f64 is served by two envs because CuPy and pip's CUDA JAX cannot
+    share an interpreter. Splitting the config id instead would put
+    dLux-on-CUDA and prysm-on-CUDA on different boards."""
+    from pathlib import Path
+
+    cfg = Config.from_yaml(Path(__file__).parent.parent / "configs" / "gpu_f64.yaml")
+    assert cfg.env_for("dlux") == "dragrace-gpu-jax"
+    assert cfg.env_for("prysm") == "dragrace-gpu-cupy"
+    assert cfg.env_for("poppy") == "dragrace-gpu-cupy"
+    assert cfg.env_for(None) == "dragrace-gpu-cupy"
+
+
+def test_cpu_configs_serve_every_adapter_from_one_environment():
+    cfg = _config()
+    assert cfg.conda_env_by_adapter == {}
+    assert cfg.env_for("dlux") == cfg.env_for("prysm") == cfg.conda_env
+
+
+def test_cuda_path_points_at_the_conda_target_dir(tmp_path):
+    """CuPy appends /include to CUDA_PATH, and conda-forge puts the headers
+    under $PREFIX/targets/<arch>/ -- so the prefix itself is the wrong answer
+    and produces 'Failed to find CUDA headers' at the first kernel launch."""
+    from dragrace.runner import cuda_path_for
+
+    prefix = tmp_path / "env"
+    (prefix / "bin").mkdir(parents=True)
+    target = prefix / "targets" / "x86_64-linux"
+    (target / "include").mkdir(parents=True)
+    (target / "include" / "cuda_runtime.h").write_text("")
+    assert cuda_path_for(str(prefix / "bin" / "python")) == str(target)
+
+
+def test_cuda_path_is_none_without_conda_cuda(tmp_path):
+    """A CPU environment must not have CUDA_PATH rewritten under it."""
+    from dragrace.runner import cuda_path_for
+
+    prefix = tmp_path / "env"
+    (prefix / "bin").mkdir(parents=True)
+    assert cuda_path_for(str(prefix / "bin" / "python")) is None
+
+
+# --------------------------------------------- per-adapter retrieval device --
+def test_retrieval_gpu_refusal_is_per_adapter():
+    """The board was CPU-only when no retrieval chain was device-aware. Now
+    that three are, the refusal has to name the adapter rather than the board,
+    or a code with a real GPU path is silently excluded from it."""
+    from pathlib import Path
+
+    from dragrace import adapter as adapter_mod
+    from dragrace.case import Case
+
+    repo = Path(__file__).parent.parent
+    adapter_mod.discover(repo / "adapters")
+    case = Case.from_yaml(
+        repo / "cases" / "phase_retrieval" / "pr_zernike11_analytic_scan.yaml"
+    ).scan_cases()[0]
+    gpu = Config.from_yaml(repo / "configs" / "gpu_f64.yaml")
+
+    for name in ("prysm", "dlux"):
+        assert adapter_mod.get(name).retrieval_support(case, gpu) is True
+    for name in ("hcipy", "lentil", "proper"):
+        sup = adapter_mod.get(name).retrieval_support(case, gpu)
+        assert not sup and "gradient" in sup.reason or "GPU" in sup.reason
