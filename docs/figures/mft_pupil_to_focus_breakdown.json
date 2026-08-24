@@ -1,0 +1,247 @@
+{
+ "case": "mft_n1024_q4",
+ "config": "cpu_numpy_1t",
+ "reps": 9,
+ "rounds": 5,
+ "bars": [
+  {
+   "adapter": "numpy_baseline",
+   "median_s": 0.01617528998758644,
+   "gemm_measured": true,
+   "gemm_raw_s": 0.016147046990226954,
+   "clamped": false,
+   "n_gemm_calls": 2,
+   "gemm_gflop": 1.207959552,
+   "rel_l2": 0.0,
+   "gemm_shapes": [
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      1024
+     ]
+    ],
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      128
+     ]
+    ]
+   ],
+   "instrument_overhead": 1.0003907832155046,
+   "instrumented": "numpy_baseline: state['kx'] viewed (used on both sides of `@`)",
+   "buckets_s": {
+    "gemm": 0.016147046990226954,
+    "kernel": 0.0,
+    "pupil": 0.0,
+    "other": 2.8242997359484434e-05
+   },
+   "gemm_span_s": [
+    0.016147046990226954,
+    0.016311654006130993
+   ]
+  },
+  {
+   "adapter": "hcipy",
+   "median_s": 0.016568891995120794,
+   "gemm_measured": true,
+   "gemm_raw_s": 0.01654052099911496,
+   "clamped": false,
+   "n_gemm_calls": 2,
+   "gemm_gflop": 1.207959552,
+   "rel_l2": 2.1131759303641316e-15,
+   "gemm_shapes": [
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      1024
+     ]
+    ],
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      128
+     ]
+    ]
+   ],
+   "instrument_overhead": 1.0050798204935563,
+   "instrumented": "hcipy: module-level wrappers only (np.dot / scipy blas)",
+   "buckets_s": {
+    "gemm": 0.01654052099911496,
+    "kernel": 2.815415880247831e-07,
+    "pupil": 8.005229735143159e-07,
+    "other": 2.728893144429405e-05
+   },
+   "gemm_span_s": [
+    0.01653820599312894,
+    0.01668834500014782
+   ]
+  },
+  {
+   "adapter": "prysm",
+   "median_s": 0.016219210985582322,
+   "gemm_measured": true,
+   "gemm_raw_s": 0.01620269101113081,
+   "clamped": false,
+   "n_gemm_calls": 2,
+   "gemm_gflop": 1.207959552,
+   "rel_l2": 9.01163874516588e-16,
+   "gemm_shapes": [
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      1024
+     ]
+    ],
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      128
+     ]
+    ]
+   ],
+   "instrument_overhead": 0.9993298687515249,
+   "instrumented": "prysm: MDFT.Ex/.Ey viewed (fttools.py MDFT.__call__ uses `@`)",
+   "buckets_s": {
+    "gemm": 0.01620269101113081,
+    "kernel": 0.0,
+    "pupil": 0.0,
+    "other": 1.65199744515121e-05
+   },
+   "gemm_span_s": [
+    0.01620269101113081,
+    0.01629755800240673
+   ]
+  },
+  {
+   "adapter": "lentil",
+   "median_s": 0.04197380901314318,
+   "gemm_measured": true,
+   "gemm_raw_s": 0.01696559099946171,
+   "clamped": false,
+   "n_gemm_calls": 2,
+   "gemm_gflop": 1.207959552,
+   "rel_l2": 0.0,
+   "gemm_shapes": [
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      1024
+     ]
+    ],
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      128
+     ]
+    ]
+   ],
+   "instrument_overhead": 0.9995350431488333,
+   "instrumented": "lentil: _dft2_matrices patched to hand back a viewed E1",
+   "buckets_s": {
+    "gemm": 0.01696559099946171,
+    "kernel": 0.003827467770059495,
+    "pupil": 0.019833706682606096,
+    "other": 0.0013470435610158779
+   },
+   "gemm_span_s": [
+    0.016847592021804303,
+    0.017058626021025702
+   ]
+  },
+  {
+   "adapter": "poppy",
+   "median_s": 0.04065260899369605,
+   "gemm_measured": true,
+   "gemm_raw_s": 0.016890400991542265,
+   "clamped": false,
+   "n_gemm_calls": 2,
+   "gemm_gflop": 1.207959552,
+   "rel_l2": 1.252375653085916e-15,
+   "gemm_shapes": [
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      1024
+     ]
+    ],
+    [
+     [
+      128,
+      1024
+     ],
+     [
+      1024,
+      128
+     ]
+    ]
+   ],
+   "instrument_overhead": 1.0156271153399603,
+   "instrumented": "poppy: module-level wrappers only (np.dot / scipy blas)",
+   "buckets_s": {
+    "gemm": 0.016890400991542265,
+    "kernel": 0.016581446285397237,
+    "pupil": 0.0037926426634543376,
+    "other": 0.00338811905330221
+   },
+   "gemm_span_s": [
+    0.016890400991542265,
+    0.017013361008139327
+   ]
+  },
+  {
+   "adapter": "dlux",
+   "median_s": 0.045887666987255216,
+   "bracketed": true,
+   "rel_hoisted_vs_full": 1.1065602781329328e-15,
+   "gemm_raw_s": 0.025384758017025888,
+   "clamped": false,
+   "buckets_s": {
+    "gemm": 0.025384758017025888,
+    "kernel": 0.003713604965014383,
+    "pupil": 0.016789304005214944,
+    "other": 0.0
+   },
+   "rel_l2": 3.5834862085322305e-15,
+   "gemm_span_s": [
+    0.025377665006089956,
+    0.02549845099565573
+   ]
+  }
+ ]
+}

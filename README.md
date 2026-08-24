@@ -320,6 +320,15 @@ half-ray spider vanes at ±30°. The vanes are load-bearing: without them the pu
 is centro-symmetric, `φ(x)` and `−φ(−x)` give the identical PSF, and the
 retrieval converges cleanly onto the **twin** of the truth.
 
+A second pair scans the other axis — `pr_nzernike_n256_numeric_scan` and
+`pr_nzernike_n256_analytic_scan` hold the pupil at 256² and sweep the number of
+free parameters from 3 to 231, logarithmically, each value a complete Noll
+radial order. That is the axis the Jurling & Fienup argument is really about:
+`P+1` versus `O(1)` forward models per gradient is a constant offset on an
+`n_pupil` scan and a **difference in slope** here. `scripts/plot_retrieval_zernike.py`
+draws it against 1 s / 5 min / 45 min / 24 h budgets, fits a power law and
+extrapolates — nothing is ever run for a day.
+
 **dLux was never single-threaded.** XLA honours none of the `*_NUM_THREADS`
 variables, and the `XLA_FLAGS` the config emitted was inert — one half governed
 an Eigen path the thunk runtime replaced, the other was not an XLA flag at all

@@ -199,7 +199,8 @@ def test_scan_series_groups_by_machine_then_adapter(tmp_path):
 
 def test_adapter_colours_are_stable_and_distinct():
     """Colour follows the adapter, so filtering one out never repaints another."""
-    names = ["numpy_baseline", "prysm", "hcipy", "poppy", "lentil", "proper", "dlux"]
+    names = ["numpy_baseline", "prysm", "hcipy", "poppy", "lentil", "proper",
+             "dlux", "abcdlux"]
     colours = [style_for(n)[0] for n in names]
     assert len(set(colours)) == len(names)
     assert style_for("prysm") == style_for("prysm")
@@ -228,3 +229,47 @@ def test_missing_contract_marker_reads_as_primitive(tmp_path):
     _write(tmp_path, _result("prysm", {128: 0.002}))
     (row,) = aggregate(tmp_path)
     assert row["contract"] == "primitive-v1"
+
+
+# ---------------------------------------------------- the n_zernike axis --
+# The one scan axis that moves neither grid. It shares the machinery with
+# n_pupil and n_focus and almost none of their constraints, which is exactly
+# where a shared code path goes wrong quietly.
+NZERNIKE_CASE = Path("cases/phase_retrieval/pr_nzernike_n256_numeric_scan.yaml")
+
+
+def test_n_zernike_scan_moves_only_the_parameter_count():
+    """Every grid is identical at every point; only P moves. If a pupil or a
+    focal grid drifted along this axis the curve would be measuring two things
+    at once and would still look perfectly reasonable."""
+    case = Case.from_yaml(NZERNIKE_CASE)
+    subs = case.scan_cases()
+
+    assert [s.n_zernike for s in subs] == sorted(case.scan.values)
+    assert {s.n_pupil for s in subs} == {256}
+    assert {s.n_across for s in subs} == {256}
+    assert {s.n_focus for s in subs} == {64}
+    assert {s.retrieval.gradient for s in subs} == {"numerical"}
+
+
+def test_n_zernike_accepts_counts_a_grid_axis_would_reject():
+    """3 and 15 are fine parameter counts and impossible array sizes. The even
+    and >= 8 rules belong to a grid's centring convention, and applying them
+    here would reject most of the shipped scan."""
+    case = Case.from_yaml(NZERNIKE_CASE)
+    assert 3 in case.scan.values and 15 in case.scan.values
+    assert any(v % 2 for v in case.scan.values), "the shipped scan has odd values"
+
+
+def test_n_zernike_scan_rejected_for_a_non_retrieval_case():
+    d = _base_dict(scan={"parameter": "n_zernike", "values": [3, 6]})
+    with pytest.raises(ValueError, match="n_zernike"):
+        Case.from_dict(d)
+
+
+def test_n_zernike_scan_rejects_a_zero_parameter_count():
+    import yaml
+    d = yaml.safe_load(Path(NZERNIKE_CASE).read_text())
+    d["scan"]["values"] = [0, 3]
+    with pytest.raises(ValueError, match=">= 1"):
+        Case.from_dict(d)

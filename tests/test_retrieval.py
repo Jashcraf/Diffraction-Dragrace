@@ -297,3 +297,70 @@ def test_adapters_split_cleanly_across_the_two_boards(config):
     assert {"prysm", "dlux"} <= on["analytic"]
     # Nobody appears on both except the harness's own floor.
     assert on["numerical"] & on["analytic"] == {"numpy_baseline"}
+
+
+# ------------------------------------------- the parameter-count board --
+# cases/phase_retrieval/pr_nzernike_n256_* holds the pupil at 256 and sweeps P.
+# What needs guarding is the amplitude convention: it is the thing that keeps
+# the problem the SAME problem all the way along the axis, and if it silently
+# reverted to per-mode the board would still run, still look plausible, and
+# quietly stop solving anything at the top of the scan.
+P_NUMERIC = "cases/phase_retrieval/pr_nzernike_n256_numeric_scan.yaml"
+P_ANALYTIC = "cases/phase_retrieval/pr_nzernike_n256_analytic_scan.yaml"
+
+
+def test_the_two_parameter_count_boards_differ_only_in_gradient():
+    a = yaml.safe_load(open(P_NUMERIC).read())
+    b = yaml.safe_load(open(P_ANALYTIC).read())
+    assert a.pop("id") != b.pop("id")
+    assert a.pop("notes") and b.pop("notes")
+    assert a["retrieval"].pop("gradient") == "numerical"
+    assert b["retrieval"].pop("gradient") == "analytic"
+    assert a == b, "the numerical and analytic P-boards have diverged in physics"
+
+
+def test_total_rms_convention_holds_the_wavefront_fixed():
+    """The point of `truth_amplitude_convention: total_rms`. Under the per-mode
+    convention the truth would grow as sqrt(P) -- 0.4 waves RMS at P=3 against
+    3.5 at P=231 -- and the retrieval would stop being well posed partway up the
+    axis, which was measured before this convention was added."""
+    case = Case.from_yaml(P_ANALYTIC)
+    assert case.retrieval.truth_amplitude_convention == "total_rms"
+
+    declared = case.retrieval.truth_amplitude_waves_rms
+    for sub in case.scan_cases():
+        assert sub.retrieval.per_mode_sigma == pytest.approx(
+            declared / np.sqrt(sub.n_zernike))
+        _, theta_true, _, _ = R.retrieval_parameters(sub)
+        # The realised RMS is a finite draw from that sigma, so it scatters --
+        # widest at P=3, where there are three samples. What must not happen is
+        # a systematic climb with P.
+        realised = float(np.sqrt(np.sum(theta_true ** 2)))
+        assert 0.5 * declared < realised < 1.6 * declared, (
+            f"P={sub.n_zernike}: wavefront is {realised:.3f} waves RMS against a "
+            f"declared {declared:g}")
+
+
+def test_per_mode_convention_is_untouched_by_the_new_field():
+    """The N-scan boards must keep meaning exactly what they meant."""
+    case = Case.from_yaml(ANALYTIC)
+    assert case.retrieval.truth_amplitude_convention == "per_mode"
+    assert case.retrieval.per_mode_sigma == case.retrieval.truth_amplitude_waves_rms
+
+
+def test_parameter_scan_values_are_complete_radial_orders():
+    """Stopping mid-order leaves one member of a rotated Zernike pair in the fit
+    and the other out, which is an asymmetry in the inverse problem rather than
+    in any code being timed. A complete order through n has (n+1)(n+2)/2 modes."""
+    complete = {(n + 1) * (n + 2) // 2 for n in range(0, 40)}
+    for v in Case.from_yaml(P_NUMERIC).scan.values:
+        assert v in complete, f"P={v} stops part way through a radial order"
+
+
+def test_parameter_scan_is_logarithmic():
+    """A runtime that spans four decades is read on a log axis, and a fit
+    extrapolated from it is only as good as the spacing of its support."""
+    values = sorted(Case.from_yaml(P_NUMERIC).scan.values)
+    ratios = [b / a for a, b in zip(values, values[1:])]
+    assert min(ratios) > 1.5 and max(ratios) < 2.8, (
+        f"steps are not close to geometric: {[round(r, 2) for r in ratios]}")

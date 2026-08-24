@@ -22,9 +22,12 @@ mood between two invocations.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import sys
+import threading
 import traceback
 from pathlib import Path
 from time import perf_counter
@@ -304,14 +307,68 @@ def _retrieval_blocks(ad, case, state, first) -> dict:
     return out
 
 
+class PointTimeout(Exception):
+    """One scan point exceeded execution.timeout_s. Not a failure of the code
+    under test -- a statement that this point was not measured, and how long it
+    was given."""
+
+
+@contextlib.contextmanager
+def _deadline(seconds: float):
+    """Abandon the enclosed block after `seconds` of wall time.
+
+    A per-point budget rather than a per-process one, and the distinction is
+    the whole reason this exists. The runner already kills a worker that
+    overruns, but a scan writes ONE result file at the end, so a process killed
+    on the last and largest point loses every point before it -- which on the
+    n_zernike board is precisely the interesting case, since the numerical
+    gradient's cost grows as P^2 and the run is expected to become unaffordable
+    somewhere along the axis. That "somewhere" is the measurement; it must not
+    also be what destroys the evidence for it.
+
+    SIGALRM, so the interruption reaches library code the harness does not own.
+    Python runs the handler between bytecodes, so a point sitting inside one
+    long C call finishes it first -- harmless here, where a retrieval returns to
+    the interpreter thousands of times a second. Silently a no-op off the main
+    thread or on a platform without SIGALRM (Windows); `elapsed_s` on the point
+    is what a reader checks rather than trusting the budget was enforced.
+    """
+    usable = (hasattr(signal, "SIGALRM") and seconds > 0
+              and threading.current_thread() is threading.main_thread())
+    if not usable:
+        yield
+        return
+
+    def _fire(signum, frame):                          # noqa: ARG001
+        raise PointTimeout(f"exceeded the {seconds:g}s per-point budget")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict:
     """Measure every point of a scan case into one `scan` block.
 
     A point that fails is recorded and the scan continues. The alternative --
     aborting the file -- throws away every size that did measure cleanly, and
     the usual reason a large point fails (memory) is itself the finding.
+
+    A point that runs out of its `execution.timeout_s` budget stops the scan
+    instead of continuing, and the points above it are recorded `skipped`.
+    Every scan axis in this harness is monotone in cost -- a bigger array, a
+    wider focal grid, more free parameters -- so a value that overran its
+    budget guarantees the ones above it will too, and attempting them would
+    spend hours to learn nothing. The refusal is recorded per point with the
+    value that triggered it, so the hole in the curve says why it is there.
     """
     points = []
+    budget = case.execution.timeout_s
+    over_budget: int | None = None
     for sub in case.scan_cases():
         value = getattr(sub, case.scan.parameter)
         point: dict[str, Any] = {
@@ -321,6 +378,21 @@ def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict
             "n_across": sub.n_across,
             "n_focus": sub.n_focus,
         }
+        if sub.is_retrieval:
+            # The free-parameter count travels with every retrieval point, not
+            # only on the board that scans it: it is the divisor the report
+            # needs to turn a wall time into a cost per parameter.
+            point["n_zernike"] = sub.n_zernike
+        if over_budget is not None:
+            point.update(
+                status="skipped",
+                reason=(f"not attempted: {case.scan.parameter}={over_budget} already "
+                        f"exceeded the {budget:g}s per-point budget, and cost on this "
+                        f"axis rises with the scan value. Raise execution.timeout_s "
+                        f"to measure it, or read the fitted extrapolation instead."))
+            points.append(point)
+            continue
+        t_point = perf_counter()
         try:
             # supports() again, per point. run() already asked once against the
             # scan case, but that carries the template size and a scan is
@@ -336,11 +408,24 @@ def _scan(ad, case, config, mode: str, out_dir: Path, adapter_name: str) -> dict
                              reason=getattr(sup, "reason", "unsupported at this size"))
                 points.append(point)
                 continue
-            point.update(_measure(ad, sub, config, mode, out_dir, adapter_name,
-                                  tag=f"_{case.scan.parameter}{value}"))
+            with _deadline(budget):
+                point.update(_measure(ad, sub, config, mode, out_dir, adapter_name,
+                                      tag=f"_{case.scan.parameter}{value}"))
+        except PointTimeout:
+            over_budget = value
+            point.update(
+                status="timeout",
+                reason=(f"abandoned after {perf_counter() - t_point:.1f}s: the point's "
+                        f"budget is execution.timeout_s = {budget:g}s, and one "
+                        f"measurement covers build, the untimed first call and "
+                        f"{case.execution.warmup} + {case.execution.repeats} runs. "
+                        f"This is a statement about affordability, not about "
+                        f"correctness -- nothing here says the code would not have "
+                        f"converged."))
         except Exception as exc:                       # noqa: BLE001
             point.update(status="failed", reason=f"{type(exc).__name__}: {exc}",
                          traceback=traceback.format_exc())
+        point["elapsed_s"] = perf_counter() - t_point
         points.append(point)
 
     ok = [p for p in points if p.get("status") == "ok"]

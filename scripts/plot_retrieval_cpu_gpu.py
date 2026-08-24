@@ -97,7 +97,10 @@ def main() -> int:
     # Reserve the strip the caption is drawn into. constrained_layout knows
     # nothing about raw fig.text, so without this the caption lands on top of
     # the x tick labels.
-    fig.get_layout_engine().set(rect=(0.008, 0.115, 0.988, 0.90))
+    # (left, bottom, WIDTH, HEIGHT) -- not (left, bottom, right, top). Read the
+    # second way this asks for a top edge at 1.015 and quietly clips the top of
+    # the axes off the canvas.
+    fig.get_layout_engine().set(rect=(0.008, 0.115, 0.984, 0.785))
     for ax in axes:
         ax.set_facecolor(SURFACE)
 

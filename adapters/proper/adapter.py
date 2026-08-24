@@ -422,7 +422,10 @@ class ProperAdapter(Adapter):
                             jac=state["jac"])
 
         if state.get("aperture"):
-            import numpy as np
+            # numpy is imported at module scope. Importing it again HERE makes
+            # `np` a local for the whole function, which turns the module-level
+            # `np` at the end of propagate() into an UnboundLocalError on every
+            # non-aperture path -- i.e. every propagation board PROPER runs.
             import proper
 
             wf = proper.prop_begin(state["diam_m"], state["case"].wavelength_m,

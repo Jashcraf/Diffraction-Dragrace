@@ -62,7 +62,8 @@ SURFACE = "#fcfcfb"
 #: Slot order for colour assignment. Fixed rather than derived from whatever
 #: happens to be in a given result set, so a figure drawn from two adapters and
 #: one drawn from six agree on which line is prysm.
-ADAPTER_ORDER = ("numpy_baseline", "prysm", "hcipy", "poppy", "lentil", "proper", "dlux")
+ADAPTER_ORDER = ("numpy_baseline", "prysm", "hcipy", "poppy", "lentil", "proper",
+                 "dlux", "abcdlux")
 
 #: Drawn as a corridor rather than as a series. It is the harness's own floor --
 #: "what does this cost if you just write it down" -- and not a competitor, so
@@ -73,6 +74,7 @@ REFERENCE_ADAPTER = "numpy_baseline"
 AXIS_LABELS = {
     "n_pupil": "pupil array size $N_p$ (samples across)",
     "n_focus": "focal grid size $N_f$ (samples across)",
+    "n_zernike": "free parameters $P$ (Zernike coefficients solved for)",
 }
 
 
@@ -93,17 +95,41 @@ def _require_matplotlib():
     return plt, Patch, pe
 
 
+def _slot(adapter: str) -> int:
+    """The adapter's fixed index into PALETTE / MARKERS / DASHES.
+
+    One function so the three encodings cannot drift apart: a figure that took
+    its colour from one rule and its dash from another would give an adapter two
+    identities, which is worse than giving it one weak one.
+    """
+    if adapter in ADAPTER_ORDER:
+        return ADAPTER_ORDER.index(adapter)
+    # An adapter this module has never heard of still gets a slot, but never by
+    # cycling a hue that already means something else.
+    return len(ADAPTER_ORDER) + sum(ord(c) for c in adapter) % 4
+
+
 def style_for(adapter: str) -> tuple[str, str]:
     """(colour, marker) for an adapter, stable across figures."""
-    if adapter in ADAPTER_ORDER:
-        i = ADAPTER_ORDER.index(adapter)
-    else:
-        # An adapter this module has never heard of still gets a slot, but never
-        # by cycling a hue that already means something else.
-        i = len(ADAPTER_ORDER) + sum(ord(c) for c in adapter) % 4
+    i = _slot(adapter)
     if i < len(PALETTE):
         return PALETTE[i], MARKERS[i]
     return OVERFLOW_COLOR, MARKERS[i % len(MARKERS)]
+
+
+def dash_for(adapter: str) -> tuple:
+    """Matplotlib dash tuple for an adapter, from the same fixed slot.
+
+    The third encoding, and on some boards the load-bearing one: these codes
+    routinely agree to within a few percent, so their lines genuinely coincide
+    and a solid line drawn over another erases it. It also carries identity for
+    a reader who cannot separate two adjacent hues -- the categorical palette
+    has one pair (poppy's amber against prysm's orange) whose normal-vision
+    separation is below the dE 15 floor, so on any figure showing both, colour
+    alone is not enough and is not asked to be.
+    """
+    on_off = DASHES[_slot(adapter) % len(DASHES)]
+    return (0, ()) if on_off[0] is None else (0, on_off)
 
 
 def scan_series(rows: list[dict], case: str | None = None,

@@ -132,12 +132,18 @@ def retrieval_parameters(case: Case, centering="pixel"
 
     noll = r.noll_indices
     rng = np.random.default_rng(r.seed)
-    theta_true = rng.normal(0.0, r.truth_amplitude_waves_rms, size=r.count)
+    # Case.Retrieval.per_mode_sigma, not the raw field: under
+    # `truth_amplitude_convention: total_rms` the declared number is the RMS of
+    # the whole wavefront and the per-coefficient sigma is it over sqrt(P). The
+    # draws themselves are unchanged by the convention, so the truth vectors at
+    # two scan points are the same random wavefront to within one scale factor.
+    sigma = r.per_mode_sigma
+    theta_true = rng.normal(0.0, sigma, size=r.count)
     if r.initial == "zeros":
         theta_init = np.zeros_like(theta_true)
     elif r.initial == "truth_perturbed":
         theta_init = theta_true + rng.normal(
-            0.0, r.initial_perturbation * r.truth_amplitude_waves_rms, size=r.count)
+            0.0, r.initial_perturbation * sigma, size=r.count)
     else:                                          # unreachable after validate()
         raise ValueError(f"unknown retrieval.initial {r.initial!r}")
     return noll, theta_true, theta_init, zernike_basis(case, noll, centering)

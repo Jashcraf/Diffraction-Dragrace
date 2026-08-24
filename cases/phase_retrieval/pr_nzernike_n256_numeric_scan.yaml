@@ -1,0 +1,178 @@
+# Phase retrieval scanned over the NUMBER OF FREE PARAMETERS -- numerical board.
+#
+# The sibling boards pr_zernike11_{numeric,analytic}_scan hold P = 11 and grow
+# the pupil array. This pair holds the pupil at 256x256 and grows P, from 3
+# Zernike coefficients to 231, which is the axis Jurling & Fienup (2014), JOSA A
+# 31(7) 1348 actually argue about:
+#
+#     finite differences   P + 1 forward models per gradient
+#     adjoint / AD         O(1) forward models per gradient, independent of P
+#
+# On an N-scan that ratio is a constant 12x and shows up as a vertical offset
+# between two figures. On a P-scan it is the SLOPE, and the two boards separate
+# rather than sitting parallel. This is the numerical half -- the codes that can
+# supply a forward model and nothing else, so scipy forms its own gradient by
+# two-point finite differences. POPPY is the code on it here.
+#
+# WHAT THE SLOPE SHOULD BE, so that the figure can be read against a prediction
+# rather than admired. Wall time is (evaluations) x (cost of one evaluation),
+# and on this axis BOTH factors move:
+#
+#   evaluations       (P + 1) per gradient, times however many iterations
+#                     L-BFGS-B needs -- and that is not constant either. The
+#                     reference implementation needs 4 iterations at P=3 and 298
+#                     at P=231, i.e. roughly linear in P. So the numerical board
+#                     is expected to go as P^2 and the analytic one as P^1, and
+#                     the difference between the two figures is one power of P.
+#   one evaluation    a matrix DFT that does not depend on P at all, plus an OPD
+#                     render that does: summing P modes over 256^2 samples.
+#                     Measured on POPPY here, one forward model costs 1.87 ms at
+#                     P=3 and 6.23 ms at P=231 -- the DFT is the floor and the
+#                     mode sum is what grows.
+#
+# WHY THE PUPIL IS PINNED AT 256. It is the middle of the sibling boards' N-scan
+# and the size at which every code on this board is already past its launch
+# overhead, so the P axis is not confounded with a device that is idle at one
+# end of the scan and saturated at the other.
+#
+# THE TRUTH IS A FIXED WAVEFRONT SUBDIVIDED, not a growing one, and this is the
+# one place this pair departs from its siblings. `truth_amplitude_convention:
+# total_rms` fixes the RMS of the whole wavefront at 0.40 waves and gives each
+# coefficient sigma = 0.40 / sqrt(P). Under the sibling boards' per-mode
+# convention the truth would instead grow as sqrt(P) -- 0.11 waves RMS at P=3,
+# 1.14 at P=496 -- and the retrieval would stop being the same problem partway
+# up the axis. That is measured, not feared: with a per-mode 0.05 the reference
+# recovers the truth to 1.9e-5 at P=55 and then lands in a local minimum at
+# P=120, loss stalling at 3.8e-5 with a coefficient error of 8.4e-2. A runtime
+# curve whose upper points are not solving the problem measures nothing.
+#
+#   Adding modes to a fixed wavefront is also the question a real instrument
+#   asks -- "how many terms do I need to fit this mirror" -- rather than
+#   "what if the mirror got worse every time I added one".
+#
+# WHY 0.40 WAVES AND NOT 0.05. Because the reachable accuracy on this problem is
+# an ABSOLUTE floor and the gate is a RELATIVE error, so a fainter truth is a
+# harder gate for no physical reason. scipy's ftol test is
+# (f_k - f_k+1)/max(|f_k|,|f_k+1|,1), and the loss here is far below 1, so ftol
+# is an absolute stopping floor; below it the weakly-constrained coefficient
+# directions simply stop moving. Measured with the reference at P=231:
+#
+#     total wavefront RMS      0.05 w    0.20 w    0.30 w    0.40 w
+#     coefficient rel. error   3.2e-2    5.6e-3    2.2e-4    1.0e-4
+#
+# 0.40 waves is the largest amplitude still safely inside the convex basin from
+# this starting point -- 0.55 waves is where the per-mode variant was measured
+# falling into a local minimum -- and it leaves a 10x margin on the gate at the
+# top of the scan. It is more aberration than a fine-phasing residual and the
+# PSF at P=231 is visibly speckled; that is a deliberate trade of realism for a
+# problem whose difficulty does not move along the axis being scanned.
+#
+# WHY THE SCAN STOPS AT 231. Not affordability -- conditioning. At P=496 the
+# reference itself drives the loss to its float64 floor and still returns
+# coefficients 7.4e-3 from the truth, and tightening ftol to 1e-20 buys 5749
+# iterations and only reaches 1.5e-2. A single in-focus PSF on a 256^2 pupil
+# does not contain 496 well-conditioned Zernike directions, so points above 231
+# would fail the gate for a reason that has nothing to do with any library.
+# Widening the focal window does not help, which is how it was established that
+# this is conditioning rather than detector truncation: at P=496 the error is
+# 5.7e-2 at 32 lambda F/D, 6.1e-2 at 64 and 7.0e-2 at 128.
+#
+# THE SCAN VALUES are logarithmic -- a factor of ~2.06 per step -- and every one
+# of them is a COMPLETE Noll radial order (3, 6, 15, 28, 55, 120, 231 are the
+# triangular numbers (n+1)(n+2)/2 for n = 1, 2, 4, 6, 9, 14, 20). Stopping
+# mid-order would leave one member of a rotated pair in the fit and the other
+# out, which is an asymmetry in the inverse problem rather than in the code
+# being timed. Radial order 20 across 256 samples is ~12 samples per
+# oscillation, so nothing here is under-resolved by the grid.
+#
+# TIMED REGION: one complete L-BFGS-B retrieval, from the perturbed start to
+# convergence. Identical in meaning to the sibling boards.
+
+id: pr_nzernike_n256_numeric_scan
+kind: phase_retrieval
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # Fixed at every scan point. This board moves P, nothing else.
+  diameter_m: 0.01
+  samples_across_diameter: 256
+  array_samples: 256
+  aperture: obstructed
+  obstruction:
+    secondary_ratio: 0.30        # obscuration diameter / D
+    spider_width_ratio: 0.02     # vane width / D
+    spider_angles_deg: [30.0, -30.0]
+    # radius, not diameter: half-ray vanes make the pupil non-centro-symmetric,
+    # which is what makes the truth the unique global minimum rather than one of
+    # a twin pair. The full argument is in pr_zernike11_numeric_scan.yaml and in
+    # dragrace.retrieval; it is geometry, so it does not change with P.
+    spider_span: radius
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 2.0
+  extent_lambda_f_d: 32.0        # -> N_f = 64, fixed at every scan point
+
+retrieval:
+  basis: zernike_noll
+  first_noll: 1                  # piston, which is unobservable and reported apart
+  count: 3                       # template; replaced by each scan value
+  truth_amplitude_waves_rms: 0.40
+  truth_amplitude_convention: total_rms   # the WAVEFRONT's RMS, not each mode's
+  seed: 20260819                 # every adapter retrieves the same wavefront
+  initial: truth_perturbed       # .. from the same starting point
+  initial_perturbation: 0.25
+  optimizer: lbfgsb
+  gradient: numerical            # <- the only field that differs from the sibling
+  # 2000, where the N-scan boards use 100, because on this axis the iteration
+  # count is part of what is being measured: the reference needs 4 iterations at
+  # P=3 and 298 at P=231. A cap that bound anywhere on the scan would flatten
+  # the curve and the flattening would look like a result.
+  max_iterations: 2000
+  ftol: 1.0e-14
+  gtol: 1.0e-10
+  history_size: 10
+  loss_normalisation: observed_peak
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_zernike
+  values: [3, 6, 15, 28, 55, 120, 231]
+
+execution:
+  # warmup 0, unlike every other board here, because the untimed first call is
+  # itself a complete retrieval -- thousands of forward models -- and has
+  # already filled every plan cache and compiled every kernel by the time the
+  # clock starts. A warm-up pass would buy nothing and cost a quarter of the
+  # board. repeats stays at 3 so the median is a median of three.
+  warmup: 0
+  repeats: 3
+  # Per point, and on this board it is load-bearing rather than a backstop. The
+  # numerical gradient's cost grows as P^2, so the axis is expected to become
+  # unaffordable somewhere along it; 900 s is roughly where POPPY's P=231 point
+  # sits (about 7.5 min for one retrieval, four of them per point). A point that
+  # overruns is recorded `timeout`, the larger points are recorded `skipped`,
+  # and scripts/plot_retrieval_zernike.py extrapolates the fitted curve through
+  # the hole rather than pretending the board ends there.
+  timeout_s: 900.0
+
+accuracy:
+  # Same 1e-3 as the sibling boards, and it holds at every scanned P: measured
+  # with the reference, 9.3e-12 at P=3 rising to 1.0e-4 at P=231. See above for
+  # why the scan stops before that margin runs out.
+  reference: internal_phase_retrieval
+  max_rel_l2: 1.0e-3
+
+notes: >
+  Read the runtime with n_fev from the same row. On this board the evaluation
+  count is not a nuisance parameter -- it is the mechanism, and it is what the
+  analytic sibling removes. POPPY's OPD assembly is host-side numpy even under
+  the GPU config (poppy.conf.use_cuda moves the propagation inside calc_psf, not
+  the adapter's mode sum), so at the top of the scan a growing share of one
+  forward model is a memory-bandwidth-bound tensordot over a P x 256 x 256
+  basis rather than POPPY's propagation. That is what a POPPY user would pay,
+  and `seconds_per_forward_model` is what makes it visible.

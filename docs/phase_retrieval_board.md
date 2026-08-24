@@ -42,6 +42,19 @@ corridor rather than a seventh line.
 - **dLux** uses `jax.value_and_grad` over the dLux optical system, minimised with
   `optax.lbfgs`, with the whole optimisation compiled into one XLA program.
 
+### …and a second pair, along the other axis
+
+| case | scans | fixed | codes |
+|---|---|---|---|
+| `pr_zernike11_numeric_scan` / `…_analytic_scan` | `n_pupil` 64 → 1024 | `P = 11` | all |
+| `pr_nzernike_n256_numeric_scan` / `…_analytic_scan` | `n_zernike` 3 → 231 | `N_p = 256` | POPPY; prysm, dLux |
+
+The first pair grows the array and holds the parameter count. The second holds
+the array and grows the parameter count, and that is the axis the Jurling &
+Fienup argument is actually about: `P + 1` versus `O(1)` forward models per
+gradient is a constant vertical offset on an `n_pupil` scan and a **difference
+in slope** on an `n_zernike` one. See [The parameter-count board](#the-parameter-count-board).
+
 ## The optical system
 
 Circular aperture, 30% linear secondary obscuration, two spider vanes at +30°
@@ -331,3 +344,120 @@ boundary per iteration, while prysm and POPPY hand scipy a host scalar and a
 host gradient every evaluation. At these problem sizes that architectural
 difference is not what decides the figure; at smaller ones it is why dLux is
 the only code faster on GPU than CPU at `N_p = 64`.
+
+## The parameter-count board
+
+`pr_nzernike_n256_numeric_scan` and `pr_nzernike_n256_analytic_scan` hold the
+pupil at 256² and sweep **P**, the number of Zernike coefficients the retrieval
+solves for, from 3 to 231. Figure:
+`scripts/plot_retrieval_zernike.py` → `docs/figures/pr_nzernike_runtime_vs_parameters.png`.
+
+The `n_pupil` boards ask "how does this code scale with the array?". This pair
+asks "how does it scale with the *problem*?", and it is the axis Jurling &
+Fienup were actually arguing about. A finite-difference gradient costs `P+1`
+forward models and an analytic one costs `O(1)`, so on a fixed-P board the ratio
+is a constant vertical offset — but here it is a **difference in slope**, and
+the iteration count rises with P on top of it, so the numerical board is
+predicted to go as `P²` and the analytic ones as `P¹`.
+
+### The scan values
+
+`3, 6, 15, 28, 55, 120, 231` — a factor of ≈2.06 per step, and every one of them
+a **complete Noll radial order**, i.e. a triangular number `(n+1)(n+2)/2` for
+`n = 1, 2, 4, 6, 9, 14, 20`. Stopping part way through an order would leave one
+member of a rotated Zernike pair in the fit and its partner out, which is an
+asymmetry in the inverse problem rather than in any code being timed. Radial
+order 20 across 256 samples is ~12 samples per oscillation, so nothing on this
+scan is under-resolved by the grid.
+
+### The truth is a fixed wavefront subdivided, not a growing one
+
+This is the one place the pair departs from its `n_pupil` siblings, and it is
+the thing that keeps the problem the *same* problem all the way along the axis.
+`truth_amplitude_convention: total_rms` fixes the RMS of the whole wavefront at
+0.40 waves and gives each coefficient `σ = 0.40/√P`.
+
+Under the siblings' per-mode convention the truth would instead grow as `√P` —
+0.11 waves RMS at P=3, 1.14 at P=496 — and the retrieval stops being solvable
+partway up. Measured with the harness's own reference retrieval at 256², per-mode
+0.05 waves:
+
+| P | wavefront | reference coefficient error | |
+|---|---|---|---|
+| 55 | 0.40 w | 1.9e-5 | converges |
+| 120 | 0.55 w | 8.4e-2 | **local minimum**, loss stalls at 3.8e-5 |
+| 496 | 1.14 w | 5.4e0 | hits the iteration cap |
+
+A runtime curve whose upper points are not solving the problem measures nothing.
+
+### Why 0.40 waves and not 0.05
+
+Because the reachable accuracy here is an **absolute** floor while the gate is a
+**relative** error, so a fainter truth is a harder gate for no physical reason.
+scipy's ftol test is `(f_k − f_k+1)/max(|f_k|,|f_k+1|,1)`, and the loss is far
+below 1, so `ftol` acts as an absolute stopping floor; below it the
+weakly-constrained coefficient directions stop moving. Measured with the
+reference at P=231:
+
+| total wavefront RMS | 0.05 w | 0.20 w | 0.30 w | 0.40 w |
+|---|---|---|---|---|
+| coefficient rel. error | 3.2e-2 | 5.6e-3 | 2.2e-4 | **1.0e-4** |
+
+0.40 waves is the largest amplitude still safely inside the convex basin from a
+25%-perturbed start — 0.55 waves is where the per-mode variant was measured
+falling into a local minimum — and it leaves a 10× margin on the 1e-3 gate at
+the top of the scan. It is more aberration than a fine-phasing residual, and the
+PSF at P=231 is visibly speckled; that is a deliberate trade of realism for a
+problem whose difficulty does not move along the axis being scanned.
+
+### Why the scan stops at 231
+
+Conditioning, not affordability. At P=496 the reference drives the loss to its
+float64 floor and still returns coefficients 7.4e-3 from the truth; tightening
+`ftol` to 1e-20 buys 5749 iterations and only reaches 1.5e-2. **A single
+in-focus PSF on a 256² pupil does not contain 496 well-conditioned Zernike
+directions.** Widening the focal window does not help, which is how this was
+established as conditioning rather than detector truncation — at P=496 the error
+is 5.7e-2 at 32 λF/D, 6.1e-2 at 64 and 7.0e-2 at 128.
+
+### What the board found
+
+`gpu_f64`, RTX 4090, 256² pupil, `complex128`. Every measured point passed its
+coefficient gate, and the fitted exponents land on the prediction:
+
+| code | gradient | P=3 | P=120 | P=231 | fit |
+|---|---|---|---|---|---|
+| POPPY | numerical | 0.053 s | 85.5 s | *timeout* | **t ∝ P^2.01** |
+| prysm | analytic (adjoint) | 0.0035 s | 0.082 s | 0.196 s | **t ∝ P^0.90** |
+| dLux | analytic (JAX) | 0.0037 s | 0.099 s | 0.248 s | **t ∝ P^0.94** |
+
+**Jurling & Fienup's argument, measured, as a difference in slope.** The
+numerical board goes as `P²` and the analytic boards as `P¹`, and the extra
+power of P is exactly the `P+1` forward models a finite-difference gradient
+costs. The two mechanisms are separable in the same table: the iteration counts
+are *the same on both boards* — POPPY needs 4, 11, 31, 53, 114, 156 iterations
+where prysm needs 4, 11, 31, 54, 123, 156 — so the finite-difference gradient is
+accurate enough to steer L-BFGS-B just as well. All of the difference is in
+`n_fev`: 20,086 against 164 at P=120, a factor of 122.
+
+Between P=3 and P=231 the gap between POPPY and prysm widens from **15×** to a
+projected **2,500×**. On the `n_pupil` board, where P is fixed, that same gap is
+a constant ~12×.
+
+**What one forward model costs also moves, and only for POPPY**: 1.90 ms at P=3
+to 4.26 ms at P=120, because its OPD assembly is host-side NumPy — a
+memory-bandwidth-bound `tensordot` over a `P × 256 × 256` basis — even under the
+GPU config, where `poppy.conf.use_cuda` moves the propagation inside `calc_psf`
+but not the adapter's mode sum. prysm and dLux keep the basis on the device and
+their per-evaluation cost is nearly flat (prysm 0.454 ms at P=3, 0.610 ms at
+P=231: a 34% rise across a 77× rise in P). That is a real cost a POPPY user
+pays, not a harness artefact, and `seconds_per_forward_model` is what makes it
+visible.
+
+**Nothing was run for a day.** POPPY's P=231 point was abandoned at its 900 s
+`execution.timeout_s` budget and is recorded `timeout`; the points above it
+would be recorded `skipped`. Extrapolating the fit, POPPY reaches 24 hours at
+**P ≈ 3,900** — 33× past its last measured point, so read it as an order of
+magnitude and not a number. prysm and dLux do not reach 24 hours anywhere below
+P = 23,100, which is the practical statement the figure exists to make: with an
+analytic gradient, adding parameters is nearly free.

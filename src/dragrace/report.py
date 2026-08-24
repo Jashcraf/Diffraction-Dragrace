@@ -268,7 +268,13 @@ def render_retrievals(rows: list[dict]) -> list[str]:
         sel = [r for r in pts if r["case"] == case and r["config"] == config
                and r.get("contract") == contract]
         out.append(f"\nRETRIEVAL {case} [{config}] [{contract}]")
-        out.append(f"{'adapter':<16}{'N':>6}{'total ms':>11}{'iters':>7}{'n_fev':>7}"
+        # The swept column is headed by whatever this board actually sweeps. "N"
+        # is right for an n_pupil scan and actively misleading on an n_zernike
+        # one, where the column reads 3, 6, 15 and a reader would take those for
+        # array sizes rather than free-parameter counts.
+        axis = {"n_pupil": "N", "n_focus": "N_f", "n_zernike": "P"}.get(
+            next((r.get("scan_param") for r in sel if r.get("scan_param")), None), "N")
+        out.append(f"{'adapter':<16}{axis:>6}{'total ms':>11}{'iters':>7}{'n_fev':>7}"
                    f"{'ms/fev':>9}{'cores':>7}{'loss drop':>11}{'fwd':>10}{'s':>3}"
                    f"{'focal x':>9}  gate")
         out.append("-" * 103)

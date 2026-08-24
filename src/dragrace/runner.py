@@ -76,6 +76,42 @@ def interpreter_for(config: Config, allow_fallback: bool = False,
                   f"`conda env create -f envs/...` (see envs/README.md)")
 
 
+def conda_env_vars(python: str) -> dict[str, str]:
+    """Make a spawned worker's environment name the env it is actually running in.
+
+    Workers are launched as `$PREFIX/bin/python`, never through
+    `conda activate`, so the inherited CONDA_PREFIX still names whichever
+    environment the SWEEP was started from. Most libraries do not care. CuPy
+    does: cupy._environment._get_cuda_path() consults CONDA_PREFIX to locate the
+    toolkit, and when that points at an environment with no CUDA in it the next
+    candidate is /usr/local/cuda -- the system install, which has no reason to
+    match the driver.
+
+    MEASURED, because the failure is not a subtle skew but a hard stop that
+    reads like a broken GPU. On this machine the system toolkit is CUDA 13.1 and
+    the driver is 12.8, so NVRTC builds an image the driver refuses and every
+    CuPy kernel dies with `CUDA_ERROR_INVALID_IMAGE: device kernel image is
+    invalid` -- surfacing from a plain `cupy.arange` inside prysm's
+    prepare_executor, which reads like a prysm bug and is not one. Both poppy
+    and prysm failed that way across the whole phase-retrieval board when the
+    sweep was launched from the CPU environment, and both passed when it was
+    launched from `dragrace-gpu-cupy`: the same run, differing only in an
+    inherited variable. `conda_env` in a config is a promise about where a
+    result was computed, and this is what keeps it from being half-kept.
+
+    PATH gets the env's bin ahead of the inherited one for the same reason: a
+    worker that shells out should find its own environment's tools first.
+    """
+    prefix = Path(python).parent.parent
+    if not (prefix / "conda-meta").is_dir():
+        return {}                    # not a conda env; leave the caller's alone
+    return {
+        "CONDA_PREFIX": str(prefix),
+        "CONDA_DEFAULT_ENV": prefix.name,
+        "PATH": str(prefix / "bin") + os.pathsep + os.environ.get("PATH", ""),
+    }
+
+
 def cuda_path_for(python: str) -> str | None:
     """CUDA_PATH for a conda interpreter whose CUDA came from conda-forge.
 
@@ -126,6 +162,10 @@ def run_one(spec: RunSpec, results_root: Path, run_id: str, machine_id: str,
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    # Before the CUDA block below, because CuPy resolves its toolkit from
+    # CONDA_PREFIX when CUDA_PATH is unset and a worker inheriting the launching
+    # environment's prefix silently reaches for the system CUDA instead.
+    env.update(conda_env_vars(python))
     cuda = cuda_path_for(python)
     if cuda:
         # CUDA_HOME too: cuda.pathfinder warns when the two disagree, and a

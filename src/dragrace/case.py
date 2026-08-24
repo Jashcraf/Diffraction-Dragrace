@@ -22,7 +22,12 @@ KINDS = {"pupil_to_focus", "plane_to_plane", "gradient", "aperture", "phase_retr
 #: distance apart, rather than pupil -> focus through a lens.
 FREE_SPACE_CLASSES = {"fresnel_tf", "fresnel_ir", "angular_spectrum"}
 DTYPES = {"complex64", "complex128"}
-SCAN_PARAMETERS = {"n_pupil", "n_focus"}
+SCAN_PARAMETERS = {"n_pupil", "n_focus", "n_zernike"}
+#: Scan axes that move a GRID. They share the constraints that come with one --
+#: even, at least 8 samples, and (for n_pupil) divisible by the padding ratio --
+#: which `n_zernike` does not: a Zernike count is a parameter count, and 3 and
+#: 15 are both perfectly good ones.
+GRID_SCAN_PARAMETERS = {"n_pupil", "n_focus"}
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,25 @@ class Retrieval:
     count: int = 11
     first_noll: int = 1                    # Noll 1..11 == piston .. primary spherical
     truth_amplitude_waves_rms: float = 0.05
+    #: What `truth_amplitude_waves_rms` is the RMS *of*, and it only becomes a
+    #: question once P is a swept axis:
+    #:
+    #:   per_mode   the standard deviation each coefficient is drawn from. The
+    #:              wavefront's total RMS is then that times sqrt(P) -- fine at
+    #:              a fixed P, and the convention the n_pupil boards use.
+    #:   total_rms  the RMS of the whole WAVEFRONT. The per-coefficient sigma
+    #:              is this over sqrt(P), so adding modes subdivides a fixed
+    #:              amount of aberration instead of piling on more.
+    #:
+    #: A P-scan needs the second, and the reason is measured rather than
+    #: aesthetic. Under `per_mode` at 0.05 waves the truth grows from 0.11 waves
+    #: RMS at P=3 to 1.14 at P=496, and the retrieval stops being the same
+    #: problem: the reference implementation recovers the truth to 1.9e-5 at
+    #: P=55 and then falls into a local minimum at P=120 (loss stalls at 3.8e-5,
+    #: coefficient error 8.4e-2). A runtime scan whose largest points are not
+    #: solving the problem at all measures nothing. See
+    #: docs/phase_retrieval_board.md.
+    truth_amplitude_convention: str = "per_mode"       # per_mode | total_rms
     seed: int = 20260819
     initial: str = "zeros"                 # zeros | truth_perturbed
     #: Standard deviation of the starting guess's offset from the truth, as a
@@ -247,6 +271,18 @@ class Retrieval:
     @property
     def noll_indices(self) -> list[int]:
         return list(range(self.first_noll, self.first_noll + self.count))
+
+    @property
+    def per_mode_sigma(self) -> float:
+        """Standard deviation ONE truth coefficient is drawn from, in waves RMS.
+
+        The single place `truth_amplitude_convention` is interpreted, so an
+        adapter can never read the raw field and get a different wavefront from
+        the reference.
+        """
+        if self.truth_amplitude_convention == "total_rms":
+            return self.truth_amplitude_waves_rms / math.sqrt(self.count)
+        return self.truth_amplitude_waves_rms
 
 
 @dataclass(frozen=True)
@@ -350,6 +386,17 @@ class Case:
         if self.is_free_space or self.is_aperture:
             return self.n_pupil
         return self.output.samples
+
+    @property
+    def n_zernike(self) -> int:
+        """Free parameters the retrieval solves for. The `n_zernike` scan axis
+        reads this back, so the worker labels a point with the count the case
+        really carries rather than with the value it was asked for."""
+        if self.retrieval is None:
+            raise AttributeError(
+                f"case {self.id!r} is not a phase_retrieval case and has no "
+                f"Zernike parameter count")
+        return self.retrieval.count
 
     @property
     def q(self) -> float:
@@ -457,6 +504,15 @@ class Case:
             elif param == "n_focus":
                 # N_f = round(q * W), so the extent is what has to move.
                 sub = replace(self, output=replace(self.output, extent_lambda_f_d=v / self.q))
+            elif param == "n_zernike":
+                # The only scan axis that leaves every grid alone. v is P, the
+                # number of Zernike coefficients the retrieval solves for, so
+                # the optical system, the sampling and the observed PSF are
+                # identical at every point and the curve is the cost of the
+                # PARAMETER COUNT and nothing else. The truth amplitude follows
+                # from it through Retrieval.per_mode_sigma rather than being
+                # restated here.
+                sub = replace(self, retrieval=replace(self.retrieval, count=v))
             else:                                      # unreachable after validate()
                 raise ValueError(f"unknown scan parameter {param!r}")
 
@@ -580,6 +636,9 @@ class Case:
             p.append(f"retrieval.gradient {r.gradient!r} not in ('numerical', 'analytic')")
         if r.optimizer != "lbfgsb":
             p.append(f"unsupported retrieval optimizer {r.optimizer!r}")
+        if r.truth_amplitude_convention not in ("per_mode", "total_rms"):
+            p.append(f"retrieval.truth_amplitude_convention "
+                     f"{r.truth_amplitude_convention!r} not in ('per_mode', 'total_rms')")
         if r.initial not in ("zeros", "truth_perturbed"):
             p.append(f"retrieval.initial {r.initial!r} not in ('zeros', 'truth_perturbed')")
         if r.initial == "truth_perturbed" and not r.initial_perturbation > 0.0:
@@ -646,14 +705,26 @@ class Case:
                     f"(array_samples / samples_across_diameter); a scan value is the "
                     f"array size and the aperture is derived from it"
                 )
-        for v in s.values:
-            if not isinstance(v, int) or v < 8:
-                p.append(f"scan value {v!r} must be an integer >= 8")
-            elif v % 2:
-                # Both grids are centred at index N//2; an odd N would put the
-                # scan's points on a different centring convention from every
-                # other case in the suite.
-                p.append(f"scan value {v} must be even (grids are centred at N//2)")
+        if s.parameter in GRID_SCAN_PARAMETERS:
+            for v in s.values:
+                if not isinstance(v, int) or v < 8:
+                    p.append(f"scan value {v!r} must be an integer >= 8")
+                elif v % 2:
+                    # Both grids are centred at index N//2; an odd N would put the
+                    # scan's points on a different centring convention from every
+                    # other case in the suite.
+                    p.append(f"scan value {v} must be even (grids are centred at N//2)")
+        elif s.parameter == "n_zernike":
+            # A parameter count, not a grid: the rules above are about sample
+            # centring and would reject P=3 and P=15 for no reason at all.
+            if not self.is_retrieval:
+                p.append(
+                    f"scan.parameter 'n_zernike' sweeps retrieval.count and is only "
+                    f"meaningful for kind=phase_retrieval, not {self.kind!r}"
+                )
+            for v in s.values:
+                if not isinstance(v, int) or v < 1:
+                    p.append(f"n_zernike scan value {v!r} must be an integer >= 1")
         if s.parameter == "n_pupil" and self.pupil.array_samples % self.pupil.samples_across_diameter:
             p.append(
                 f"an n_pupil scan needs array_samples ({self.pupil.array_samples}) to be an "

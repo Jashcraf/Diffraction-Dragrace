@@ -1,0 +1,112 @@
+# Phase retrieval scanned over the NUMBER OF FREE PARAMETERS -- analytic board.
+#
+# The sibling of pr_nzernike_n256_numeric_scan, and IDENTICAL to it in every
+# value except `retrieval.gradient`. tests/test_retrieval.py asserts that field
+# by field: the pair exists to isolate one variable, and if the physics drifted
+# between them the comparison of the two figures would silently stop meaning
+# anything.
+#
+# Here the forward model returns (loss, dloss/dtheta) and the optimiser never
+# forms a difference quotient:
+#
+#   prysm   a hand-written adjoint built from prysm's own reverse-mode API,
+#           sum_of_2d_modes_adjoint and focus_dft_adjoint, driven by the same
+#           scipy L-BFGS-B call the numerical board uses with jac=True.
+#   dLux    jax.value_and_grad over the dLux optical system, with the whole
+#           L-BFGS loop compiled into one XLA program via optax. The compile
+#           lands in setup.first_call_s and grows with P -- 0.9 s at P=15,
+#           5.5 s at P=231 -- while the timed region stays pure execution.
+#           That is the same treatment the propagation boards give it, and the
+#           two numbers should be read together.
+#
+# WHAT THIS BOARD IS FOR. Against its numerical sibling it separates two things
+# that a fixed-P board cannot:
+#
+#   the OFFSET between the boards is the P+1 versus O(1) evaluation count -- the
+#   Jurling & Fienup ratio, which an N-scan already shows.
+#   the SLOPE between the boards is the same argument differentiated. A
+#   finite-difference gradient costs P+1 forward models and the iteration count
+#   itself rises with P, so the numerical board is predicted to go as P^2; an
+#   adjoint costs O(1) per gradient, so this one should go as P^1, with the
+#   residual P-dependence coming only from summing more modes into the OPD.
+#   Measured on prysm here, one loss-and-gradient evaluation costs 0.454 ms at
+#   P=3 and 0.610 ms at P=231 -- a 34% rise across a 77x rise in P, which is
+#   what "independent of P" looks like when the mode sum is not free.
+#
+# An analytic gradient is not free per evaluation, and that is exactly why both
+# boards exist rather than one plus an argument.
+#
+# Everything else -- the optical system, the truth wavefront, the starting
+# guess, the convergence tests, the iteration cap, the L-BFGS history length and
+# the scan values -- is the numerical board's, and the reasoning behind each is
+# written out in that file rather than duplicated here.
+#
+# TIMED REGION: one complete retrieval, from the perturbed start to convergence.
+
+id: pr_nzernike_n256_analytic_scan
+kind: phase_retrieval
+algorithm_class: matrix_dft
+
+wavelength_m: 632.8e-9
+
+pupil:
+  # Fixed at every scan point. This board moves P, nothing else.
+  diameter_m: 0.01
+  samples_across_diameter: 256
+  array_samples: 256
+  aperture: obstructed
+  obstruction:
+    secondary_ratio: 0.30        # obscuration diameter / D
+    spider_width_ratio: 0.02     # vane width / D
+    spider_angles_deg: [30.0, -30.0]
+    # radius, not diameter: half-ray vanes break the pupil's centro-symmetry,
+    # which is what makes the truth the unique global minimum. See the sibling.
+    spider_span: radius
+
+output:
+  focal_length_m: 1.0
+  samples_per_lambda_f_d: 2.0
+  extent_lambda_f_d: 32.0        # -> N_f = 64, fixed at every scan point
+
+retrieval:
+  basis: zernike_noll
+  first_noll: 1                  # piston, which is unobservable and reported apart
+  count: 3                       # template; replaced by each scan value
+  truth_amplitude_waves_rms: 0.40
+  truth_amplitude_convention: total_rms   # the WAVEFRONT's RMS, not each mode's
+  seed: 20260819                 # the same wavefront as the numerical board
+  initial: truth_perturbed       # .. and the same starting point
+  initial_perturbation: 0.25
+  optimizer: lbfgsb
+  gradient: analytic             # <- the only field that differs from the sibling
+  max_iterations: 2000
+  ftol: 1.0e-14
+  gtol: 1.0e-10
+  history_size: 10
+  loss_normalisation: observed_peak
+
+dtype: complex128
+basis_caching: precomputed
+
+scan:
+  parameter: n_zernike
+  values: [3, 6, 15, 28, 55, 120, 231]
+
+execution:
+  warmup: 0
+  repeats: 3
+  timeout_s: 900.0
+
+accuracy:
+  reference: internal_phase_retrieval
+  max_rel_l2: 1.0e-3
+
+notes: >
+  dLux deviates from the brief in one named place, unchanged from the N-scan
+  board: optax ships L-BFGS with a zoom line search and has no box-constrained
+  L-BFGS-B, so the bound-projection step is absent. Nothing here is bounded, so
+  the two are the same algorithm on this problem -- but they are different
+  implementations with different line searches, and a reader comparing prysm's
+  row against dLux's is comparing those too. dLux's n_fev is derived from
+  optax's own num_linesearch_steps counter rather than counted, because the loop
+  is one compiled program with no host-side call to intercept.

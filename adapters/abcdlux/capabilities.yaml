@@ -1,0 +1,86 @@
+# Declared capabilities for the abcdLux adapter.
+# `dragrace doctor` renders this; the worker verifies the runtime-checkable
+# parts against what actually resolved and refuses a run on a mismatch.
+
+name: abcdlux
+status: verified            # exercised against abcdLux 0.0.2 on this machine:
+                            # mft_n1024_q4 rel_l2=2.271e-15 scale=256,
+                            # fresnel_d50_z1m rel_l2=2.857e-13 scale=1
+reviewed_by: ""             # invite Louis Desdoigts before publishing results
+source: "abcdLux (github.com/LouisDesdoigts/abcdLux)"
+version_measured: "0.0.2"
+
+algorithm_classes:
+  - matrix_dft              # fraunhofer_kernels + fraunhofer_kernel_prop
+  - fresnel_tf              # asm_kernels + asm_kernel_prop (paraxial -- see below)
+
+devices: [cpu, cuda]        # whatever jaxlib is installed provides
+fft_backends: [xla]         # XLA supplies its own; the `fft` axis is NOT
+                            # APPLICABLE, a declared hole rather than a gap
+blas_backends: [unknown]    # XLA emits its own kernels, no NumPy BLAS route
+precisions: [complex64, complex128]   # complex128 requires JAX_ENABLE_X64=1
+
+grid_centering: interpixel  # abcdLux.coords.nd_coords, both planes. Measured:
+                            # 2.36e-15 interpixel vs 2.82e-01 pixel.
+
+gradient:
+  supported: false          # reachable (jax.value_and_grad differentiates
+  reason: >                 # fraunhofer_kernel_prop unmodified) but not written
+    abcdLux has no pupil layer, so the gradient case's Zernike forward model
+    would have to be hand-written against jax.numpy -- which would measure XLA,
+    not abcdLux. The dlux adapter is the right row for that board.
+
+profiler: jax_profiler      # VizTracer sees nothing inside a jitted call: the
+                            # whole propagation is one XLA executable
+
+async_dispatch: true
+sync: "jax.block_until_ready"
+
+required_env:
+  JAX_ENABLE_X64: "1"                    # must be set before the first jax import
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false" # or device memory numbers are fiction
+
+not_implemented:
+  fft: >
+    abcdLux has lct.lct_prop_fft and it would be a fair entry on the FFT board.
+    This adapter does not wire it up, and declines rather than routing an FFT
+    case through the MFT -- fft_array_scan gates against internal_mft, so an MFT
+    answer would pass the gate and file an MFT row on the FFT board.
+  angular_spectrum: >
+    abcdLux.asm_kernels documents itself as building
+    H = exp(-i pi lam z (fx^2 + fy^2)), which is the PARAXIAL kernel under an
+    ASM name -- the same situation as dLux's ASMPropagator. It is measured
+    against the paraxial reference (fresnel_tf) and passes there at 1.6e-15;
+    gating it against the exact form would show the 4.07e-6 paraxial-vs-exact
+    difference and mark it wrong for a documented choice.
+  aperture: >
+    abcdLux is a propagator library with no aperture layer at all.
+  phase_retrieval: >
+    Not written. See gradient.reason -- the same missing pupil layer.
+
+notes: >
+  This adapter exists to price ONE design difference against the dlux adapter,
+  which shares its author, its language and its execution engine: dLux rebuilds
+  the MFT transfer matrices inside every propagation
+  (dLux.utils.propagation.MFT calls vmap(get_tf_mat)(shift) per call, because
+  the matrices depend on `wavelength`, which is the traced input), while abcdLux
+  hands the caller the kernels as values and takes them back as arguments.
+
+  That hoist is abcdLux's own API rather than this adapter's liberty: every
+  propagator ships as a kernels()/kernel_prop() pair, with the all-in-one
+  wrapper (fraunhofer_prop, asm_prop) as the convenience form. build() calls the
+  first half and propagate() calls the second, which is exactly the seam the
+  library already cut.
+
+  A SECOND difference is folded into the same two rows and must not be read as
+  part of the first: this adapter is handed a pre-built complex pupil field
+  (dragrace.grid.pupil_field in build(), as every NumPy-backed adapter is),
+  while dLux reconstructs the phasor from transmission and OPD inside the traced
+  function on every call, because propagate_mono takes a wavelength. Both are
+  properties of how each library is used, not artefacts of the measurement.
+
+  NORMALISATION. abcdLux carries a throughput-preserving scale
+  S = sqrt(dx_in*dx_out*dy_in*dy_out)/(lam*f) where this suite's reference
+  carries dx^2. The two differ by exactly n_across/q -- measured 256.000 at
+  n_across=1024, q=4. The gate fits one complex scale, so this is reported as
+  scale_abs rather than being an error.
