@@ -176,6 +176,26 @@ def _central_differences(fun, theta, h=1e-7):
                      for i in range(theta.size)])
 
 
+def _gradient_adapter(name, case, config):
+    """The configured adapter, or a skip carrying the adapter's own reason.
+
+    CI installs no propagators on purpose (see .github/workflows/verify.yml),
+    and prysm's adjoint API is not on PyPI at all -- 0.21.1 is the newest
+    release and `focus_dft_adjoint` landed after it, so a bare runner cannot
+    have it even in principle. Gating on the same signal the report uses keeps
+    "not installed" out of the failure column while leaving the check fully
+    loud in the environment that produces published numbers, which is the only
+    one where a wrong adjoint could reach a figure.
+    """
+    adapter_mod.discover("adapters")
+    ad = adapter_mod.get(name)
+    for verdict in (ad.check_requirements(), ad.supports(case, config)):
+        if not verdict:
+            pytest.skip(getattr(verdict, "reason", f"{name} is unsupported here"))
+    assert ad.configure(config)
+    return ad
+
+
 @pytest.mark.parametrize("name", ["numpy_baseline", "prysm"])
 def test_analytic_gradient_matches_central_differences(name, case, config):
     """The check that would have caught the crossed Wirtinger conventions.
@@ -191,10 +211,7 @@ def test_analytic_gradient_matches_central_differences(name, case, config):
     This is why the boards are defined at the PARAMETER level and never compare
     intermediates -- see docs/gradient_board.md.
     """
-    adapter_mod.discover("adapters")
-    ad = adapter_mod.get(name)
-    assert ad.configure(config)
-    state = ad.build(case, config)
+    state = _gradient_adapter(name, case, config).build(case, config)
     fun, theta = state["fun"], np.asarray(state["theta0"])
 
     analytic = np.asarray(fun(theta)[1], dtype=float)
@@ -215,10 +232,7 @@ def test_piston_gradient_is_identically_zero(name, case, config):
     not merely small. It stays in the parameter vector because 'the first 11'
     means Noll 1..11, and the accuracy gate excludes it rather than pretending
     it was recovered."""
-    adapter_mod.discover("adapters")
-    ad = adapter_mod.get(name)
-    assert ad.configure(config)
-    state = ad.build(case, config)
+    state = _gradient_adapter(name, case, config).build(case, config)
     grad = np.asarray(state["fun"](np.asarray(state["theta0"]))[1], dtype=float)
     assert abs(grad[0]) < 1e-15 * max(np.abs(grad[1:]).max(), 1e-300)
 
@@ -286,17 +300,41 @@ def test_ideal_work_reports_no_total_for_a_retrieval(case):
     assert "measured rather than derivable" in work.detail
 
 
+def _declared_boards(ad) -> tuple[str, ...]:
+    g = ad.retrieval_gradient
+    return () if g is None else (g,) if isinstance(g, str) else tuple(g)
+
+
 def test_adapters_split_cleanly_across_the_two_boards(config):
+    """Board membership is declared, and the declaration is enforced.
+
+    Read off supports() this would be a statement about the environment rather
+    than about the split: supports() also answers "is this library installed
+    here", prysm and dLux gate on their own imports where the numerical four do
+    not, so on a runner with no propagators the analytic board comes back empty
+    while the numerical one looks full. The split itself has to hold with
+    nothing installed, which is what these two halves check -- who declares
+    which board, and that every adapter refuses the other one.
+    """
     adapter_mod.discover("adapters")
-    numeric = Case.from_yaml(NUMERIC).scan_cases()[0]
-    analytic = Case.from_yaml(ANALYTIC).scan_cases()[0]
-    on = {c.retrieval.gradient: {n for n in adapter_mod.available()
-                                 if adapter_mod.get(n).supports(c, config)}
-          for c in (numeric, analytic)}
+    on = {board: {n for n in adapter_mod.available()
+                  if board in _declared_boards(adapter_mod.get(n))}
+          for board in ("numerical", "analytic")}
     assert {"poppy", "lentil", "proper", "hcipy"} <= on["numerical"]
     assert {"prysm", "dlux"} <= on["analytic"]
     # Nobody appears on both except the harness's own floor.
     assert on["numerical"] & on["analytic"] == {"numpy_baseline"}
+
+    # The refusal comes from retrieval_support(), ahead of every
+    # library-availability gate, so it is checkable on a bare runner.
+    numeric = Case.from_yaml(NUMERIC).scan_cases()[0]
+    analytic = Case.from_yaml(ANALYTIC).scan_cases()[0]
+    for c, board in ((numeric, "numerical"), (analytic, "analytic")):
+        for n in on["numerical"] | on["analytic"]:
+            ad = adapter_mod.get(n)
+            if board not in _declared_boards(ad):
+                assert not ad.supports(c, config), (
+                    f"{n} accepted the {board} board it does not declare")
 
 
 # ------------------------------------------- the parameter-count board --

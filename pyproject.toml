@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 profile = ["viztracer>=0.16", "vizplugins"]
 report  = ["pandas>=2.0", "matplotlib>=3.7", "pyarrow"]
-dev     = ["pytest>=7.4", "scipy>=1.11", "jax"]
+dev     = ["pytest>=7.4", "scipy>=1.11"]
 
 [project.scripts]
 dragrace = "dragrace.cli:main"
