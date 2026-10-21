@@ -171,7 +171,8 @@ def _measure(ad, case, config, mode: str, out_dir: Path, adapter_name: str,
         cmp_ = compare(out, reference_field(case, centering), case)
         res["accuracy"] = cmp_.to_dict()
         res["accuracy"]["grid_centering"] = centering
-        if not case.pupil.aberration.coefficients and not case.is_aperture:
+        if (case.kind == "pupil_to_focus" and case.pupil.aperture == "circular"
+                and not case.pupil.aberration.coefficients):
             phys = compare(out, airy_field(case, centering), case)
             res["accuracy"]["physics_check_analytic_airy"] = {
                 "rel_l2": phys.rel_l2, "peak_ratio": phys.peak_ratio,

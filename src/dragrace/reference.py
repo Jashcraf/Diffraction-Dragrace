@@ -19,7 +19,7 @@ import numpy as np
 from dataclasses import replace
 
 from .case import Case
-from .grid import circular_aperture, focus_coords, opd_waves, pupil_coords
+from .grid import aperture_mask, circular_aperture, focus_coords, opd_waves, pupil_coords
 
 
 def airy_field(case: Case, centering="pixel") -> np.ndarray:
@@ -51,7 +51,7 @@ def reference_mft(case: Case, centering="pixel") -> np.ndarray:
     """
     x = pupil_coords(case, centering)
     u = focus_coords(case, centering)
-    field = (circular_aperture(case, centering)
+    field = (aperture_mask(case, centering)
              * np.exp(2j * np.pi * opd_waves(case, centering))).astype(np.complex128)
 
     # E_f[v,u] = sum_{y,x} E_p[y,x] exp(-2i pi (x u + y v)) dx dy
@@ -101,7 +101,7 @@ def reference_free_space(case: Case, centering="pixel") -> np.ndarray:
     at index N//2 while numpy.fft puts the origin at index 0, and getting that
     wrong produces a checkerboard sign pattern rather than an obvious failure.
     """
-    field = (circular_aperture(case, centering)
+    field = (aperture_mask(case, centering)
              * np.exp(2j * np.pi * opd_waves(case, centering))).astype(np.complex128)
     h = free_space_transfer_function(case, case.algorithm_class)
     spectrum = np.fft.fft2(np.fft.ifftshift(field))
