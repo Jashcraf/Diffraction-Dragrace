@@ -591,6 +591,11 @@ class Case:
         elif self.output is None:
             p.append(f"kind={self.kind} requires an `output:` block")
         p += self._scan_problems()
+        if self.accuracy.reference == "analytic_airy" and self.pupil.aperture != "circular":
+            p.append(
+                "accuracy.reference=analytic_airy requires a clear circular pupil; "
+                "use reference=internal_mft for obstructed focal-plane cases"
+            )
         if self.accuracy.reference == "analytic_airy" and self.pupil.aberration.coefficients:
             p.append(
                 "accuracy.reference=analytic_airy is only valid for an unaberrated pupil; "
