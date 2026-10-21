@@ -117,6 +117,13 @@ Gate: per-component relative error `< 1e-6` **and** cosine similarity
 classic Wirtinger slip) can hide under a loose per-component tolerance while
 showing up immediately in `scale_ratio`.
 
+Exactly-zero reference components are checked against the largest absolute
+reference component, using the same relative tolerance. They are not omitted:
+a spurious derivative can pass the cosine check while exceeding this tolerance.
+An entirely zero reference passes only against an entirely zero test gradient;
+in that case the reported cosine and scale ratio are defined as 1. Nonfinite
+gradients fail the gate.
+
 Complex-step differentiation is unavailable here because the model is already
 complex-valued, so central differences with a carefully chosen `h` is the
 available ground truth. **dLux at its default complex64 will not pass this
