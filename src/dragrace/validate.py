@@ -388,12 +388,27 @@ def compare_gradients(test: np.ndarray, ref: np.ndarray,
     if test.shape != ref.shape:
         raise ValueError(f"gradient shape mismatch: {test.shape} vs {ref.shape}")
 
-    denom = np.where(np.abs(ref) > 0, np.abs(ref), np.nan)
-    max_rel = float(np.nanmax(np.abs(test - ref) / denom))
+    if not test.size:
+        raise ValueError("cannot compare empty gradients")
+    if not (np.isfinite(test).all() and np.isfinite(ref).all()):
+        return GradientComparison(float("inf"), 0.0, float("inf"), "fail")
+
+    nonzero = ref != 0
+    if not nonzero.any():
+        # No reference scale exists. With no absolute tolerance specified,
+        # only another exactly-zero gradient establishes agreement.
+        if not test.any():
+            return GradientComparison(0.0, 1.0, 1.0, "pass")
+        return GradientComparison(float("inf"), 0.0, float("inf"), "fail")
+
+    # Zero derivatives still constrain the adapter: discarding them lets a
+    # spurious sensitivity pass whenever the cosine remains close enough.
+    # Scale those entries by the reference magnitude to tolerate roundoff.
+    denom = np.where(nonzero, np.abs(ref), np.max(np.abs(ref)))
+    max_rel = float(np.max(np.abs(test - ref) / denom))
     nt, nr = np.linalg.norm(test), np.linalg.norm(ref)
     cos = float(np.dot(test, ref) / (nt * nr)) if nt > 0 and nr > 0 else 0.0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = float(np.nanmedian(np.where(np.abs(ref) > 0, test / ref, np.nan)))
+    ratio = float(np.median(test[nonzero] / ref[nonzero]))
 
     ok = (max_rel <= rtol) and (1.0 - cos <= cos_tol)
     return GradientComparison(max_rel, cos, ratio, "pass" if ok else "fail")
